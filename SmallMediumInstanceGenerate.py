@@ -266,11 +266,11 @@ NUM_DRONES = 2
 # 每组 (路网节点数, 目标边数)
 SMALL_MEDIUM_CONFIGS = [
     # (road_nodes, edges)
+    (4,  3),
     (5,  4),
     (6,  5),
-    (7,  6),
-    (7,  7),
-    (7,  8),
+    (6,  6),
+    (6,  7),
 ]
 
 MODES = ["grid"]   # 小中规模使用 grid 模式
@@ -285,7 +285,7 @@ DEPOT_DIRECTIONS = [
 ]
 
 # 每组配置生成的随机实例数
-NUM_INSTANCES_PER_CONFIG = 3
+NUM_INSTANCES_PER_CONFIG = 1
 
 # 输出目录
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "算例", "小中规模算例")
