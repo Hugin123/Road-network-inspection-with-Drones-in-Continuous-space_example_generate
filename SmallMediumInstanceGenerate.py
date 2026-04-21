@@ -236,7 +236,6 @@ def save_instance(filepath, G, pos, depot_pos, num_drones):
         f.write(f"{DRONE_CALL_COST}\n")
         f.write(f"{DRONE_INSPECT_COEF}\n")
         f.write(f"{DRONE_TRANSFER_COEF}\n")
-        f.write(f"{DRONE_DRIVE_COST}\n")
         f.write(f"{BIG_M}\n")
         f.write(f"\n")
         # 坐标
