@@ -206,7 +206,7 @@ def save_instance(filepath, G, pos, depot_pos, num_drones):
     """
     将算例写入 txt 文件。
     节点编号规则：基站=0，路网节点 1..N（1-indexed）。
-    坐标列表顺序：先列路网节点（1-indexed顺序），最后是基站（0）。
+    坐标列表顺序：基站（0）坐标放第一位，后续依次是路网节点（1..N）坐标。
     需求弧：所有路网边，端点编号 1-indexed。
     """
     num_road_nodes = G.number_of_nodes()     # 路网节点数（不含基站）
@@ -217,8 +217,9 @@ def save_instance(filepath, G, pos, depot_pos, num_drones):
     for road_node in range(num_road_nodes):
         all_pos[road_node + 1] = pos[road_node]   # 1-indexed，直接使用原始坐标
 
-    x_list = [all_pos[i][0] for i in range(1, total_nodes)] + [all_pos[0][0]]
-    y_list = [all_pos[i][1] for i in range(1, total_nodes)] + [all_pos[0][1]]
+    # 坐标列表：基站（0）放第一位，后续是路网节点（1..N）
+    x_list = [all_pos[0][0]] + [all_pos[i][0] for i in range(1, total_nodes)]
+    y_list = [all_pos[0][1]] + [all_pos[i][1] for i in range(1, total_nodes)]
 
     edges = list(G.edges())
 
