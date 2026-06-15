@@ -1655,12 +1655,310 @@ class ALNSPSOSolver:
 
         return best_sol, self.best_cost_history
 
+    def solve_parallel_worker(
+        self,
+        pool: 'SharedPool',
+        thread_id: int,
+        push_freq: int = 50,
+        stagnation_limit: int = 100,
+        initial_sol: Optional[Solution] = None,
+        verbose: bool = False,
+    ) -> Tuple[Solution, List[float]]:
+        """
+        并行工作线程的求解主体。
+        在原 ALNS+PSO 主循环基础上增加两种与公共池的交互：
+          1. 推送（每 push_freq 次迭代）：将本线程当前最优解推送到公共池；
+          2. 拉取（连续 stagnation_limit 次迭代未改进时）：从公共池拉取全局最优解，
+             以该解的断点配置重新构建当前解，重置停滞计数器。
+        """
+        inst = self.inst
+
+        # ---- 初始解 ----
+        if initial_sol is None:
+            current_sol = multi_start_initial_solution(inst, n_starts=10)
+        else:
+            current_sol = initial_sol.copy()
+        current_sol = self._try_add_remove_breakpoints(current_sol)
+        current_cost = compute_cost(current_sol, inst)
+        best_sol = current_sol.copy()
+        best_cost = current_cost
+
+        if self.sa_temp is None:
+            self.sa_temp = current_cost * 0.05
+
+        self.cost_history = [current_cost]
+        self.best_cost_history = [best_cost]
+
+        stagnation_count = 0   # 连续未改进计数
+
+        for iteration in range(self.max_iter):
+            removal_fraction = random.uniform(self.removal_min, self.removal_max)
+
+            # 破坏 + 修复
+            di_op = self._roulette_select(self.destroy_weights)
+            ri_op = self._roulette_select(self.repair_weights)
+            destroyed_sol, removed = self.destroy_ops[di_op](
+                current_sol, inst, removal_fraction
+            )
+            new_sol = self.repair_ops[ri_op](destroyed_sol, inst, removed)
+
+            # PSO 优化断点
+            if (iteration + 1) % self.pso_freq == 0:
+                new_sol = self._run_pso_on_solution(new_sol)
+
+            # 断点邻域搜索
+            bp_full_freq = max(1, self.pso_freq // 2)
+            if (iteration + 1) % bp_full_freq == 0:
+                new_sol = self._try_add_remove_breakpoints(new_sol, fast_mode=False)
+            else:
+                new_sol = self._try_add_remove_breakpoints(new_sol, fast_mode=True)
+
+            new_cost = compute_cost(new_sol, inst)
+
+            # 接受准则
+            score = 0.0
+            if new_cost < best_cost:
+                best_sol = new_sol.copy()
+                best_cost = new_cost
+                current_sol = new_sol.copy()
+                current_cost = new_cost
+                score = self.sigma1
+                stagnation_count = 0          # 有改进，重置停滞计数
+            elif new_cost < current_cost:
+                current_sol = new_sol.copy()
+                current_cost = new_cost
+                score = self.sigma2
+                stagnation_count += 1
+            elif self._sa_accept(current_cost, new_cost):
+                current_sol = new_sol.copy()
+                current_cost = new_cost
+                score = self.sigma3
+                stagnation_count += 1
+            else:
+                stagnation_count += 1
+
+            self._update_weights(di_op, ri_op, score)
+            self.sa_temp *= self.sa_cooling
+
+            if (iteration + 1) % self.segment_size == 0:
+                self._normalize_weights()
+
+            self.cost_history.append(current_cost)
+            self.best_cost_history.append(best_cost)
+
+            # ---- 推送：每 push_freq 次迭代把本线程最优解推入公共池 ----
+            if (iteration + 1) % push_freq == 0:
+                pool.push(best_sol, best_cost, thread_id)
+                if verbose:
+                    print(f"  [T{thread_id}] Iter {iteration+1:4d} push cost={best_cost:.4f}")
+
+            # ---- 拉取：停滞超过 stagnation_limit 次时从公共池拉取全局最优 ----
+            if stagnation_count >= stagnation_limit:
+                global_sol, global_cost = pool.pull_best()
+                if global_sol is not None and global_cost < current_cost:
+                    # 以公共池最优解的断点配置重新构建路径作为新起点
+                    restarted = greedy_build_solution_from_breakpoints(
+                        inst, list(global_sol.breakpoints)
+                    )
+                    restarted_cost = compute_cost(restarted, inst)
+                    current_sol = restarted.copy()
+                    current_cost = restarted_cost
+                    if restarted_cost < best_cost:
+                        best_sol = restarted.copy()
+                        best_cost = restarted_cost
+                    if verbose:
+                        print(f"  [T{thread_id}] Iter {iteration+1:4d} pull "
+                              f"global={global_cost:.4f} → restart={restarted_cost:.4f}")
+                stagnation_count = 0
+
+        # ---- 最终精化 ----
+        final_sol = self._try_add_remove_breakpoints(best_sol)
+        if compute_cost(final_sol, inst) < best_cost:
+            best_sol = final_sol
+            best_cost = compute_cost(final_sol, inst)
+        final_sol2 = self._run_pso_on_solution(best_sol)
+        if compute_cost(final_sol2, inst) < best_cost:
+            best_sol = final_sol2
+            best_cost = compute_cost(final_sol2, inst)
+        final_sol3 = self._try_add_remove_breakpoints(best_sol)
+        if compute_cost(final_sol3, inst) < best_cost:
+            best_sol = final_sol3
+            best_cost = compute_cost(final_sol3, inst)
+
+        # 最终结果也推送到公共池
+        pool.push(best_sol, best_cost, thread_id)
+        if verbose:
+            print(f"  [T{thread_id}] 完成，最优费用: {best_cost:.4f}")
+
+        return best_sol, self.best_cost_history
+
 
 # ============================================================
-# 9. 结果输出与可视化
+# 9. 公共解池 + 并行求解
 # ============================================================
 
-def print_solution_detail(sol: Solution, inst: Instance):
+import threading
+
+
+class SharedPool:
+    """
+    线程安全的公共解池。
+    维护一个固定容量的精英解列表（按费用升序），供各线程异步推送/拉取。
+    """
+    def __init__(self, capacity: int = 5):
+        self._lock = threading.Lock()
+        self._pool: List[Tuple[float, Solution]] = []   # (cost, sol)
+        self.capacity = capacity
+        self.total_pushes = 0
+        self.total_pulls = 0
+
+    def push(self, sol: Solution, cost: float, thread_id: int = -1):
+        """将一个解推入公共池；若超出容量则淘汰最差解。"""
+        with self._lock:
+            self._pool.append((cost, sol.copy()))
+            self._pool.sort(key=lambda x: x[0])
+            if len(self._pool) > self.capacity:
+                self._pool = self._pool[:self.capacity]
+            self.total_pushes += 1
+
+    def pull_best(self) -> Tuple[Optional[Solution], float]:
+        """拉取公共池中当前最优解（不移除）。"""
+        with self._lock:
+            self.total_pulls += 1
+            if self._pool:
+                cost, sol = self._pool[0]
+                return sol.copy(), cost
+            return None, float('inf')
+
+    def global_best(self) -> Tuple[Optional[Solution], float]:
+        """获取全局最优解（不计入 pull 统计）。"""
+        with self._lock:
+            if self._pool:
+                cost, sol = self._pool[0]
+                return sol.copy(), cost
+            return None, float('inf')
+
+    def stats(self) -> str:
+        with self._lock:
+            n = len(self._pool)
+            best = self._pool[0][0] if self._pool else float('inf')
+        return (f"SharedPool: size={n}/{self.capacity}, "
+                f"best={best:.4f}, pushes={self.total_pushes}, "
+                f"pulls={self.total_pulls}")
+
+
+def parallel_solve(
+    inst: Instance,
+    num_threads: int = 4,
+    max_iter: int = 500,
+    push_freq: int = 50,
+    stagnation_limit: int = 100,
+    pool_capacity: int = 5,
+    pso_freq: int = 50,
+    pso_particles: int = 15,
+    pso_iter: int = 20,
+    verbose: bool = True,
+) -> Tuple[Solution, List[float]]:
+    """
+    异步并行 ALNS+PSO 求解。
+
+    机制：
+    - 同时启动 num_threads 个线程，每个线程独立运行 ALNS+PSO 主循环；
+    - 每隔 push_freq 次迭代，线程将自身最优解推送到公共池（SharedPool）；
+    - 当线程连续 stagnation_limit 次迭代未改进时，从公共池拉取全局最优解，
+      以其断点配置重新构建当前解，重置停滞计数；
+    - 所有线程完成后，取公共池中全局最优解作为最终解。
+
+    参数：
+        num_threads:       并行线程数
+        max_iter:          每个线程的 ALNS 迭代次数
+        push_freq:         向公共池推送最优解的频率（每 X 次迭代推送一次）
+        stagnation_limit:  触发拉取的连续未改进迭代阈值（Y 次）
+        pool_capacity:     公共池容量（保留前 N 优解）
+    """
+    pool = SharedPool(capacity=pool_capacity)
+
+    if verbose:
+        print(f"\n{'='*60}")
+        print(f"异步并行 ALNS+PSO 启动")
+        print(f"  线程数: {num_threads}  迭代数/线程: {max_iter}")
+        print(f"  推送频率: 每 {push_freq} 次迭代  停滞阈值: {stagnation_limit} 次")
+        print(f"  公共池容量: {pool_capacity}")
+        print(f"{'='*60}")
+
+    threads = []
+    thread_results: List[Optional[Tuple[Solution, List[float]]]] = [None] * num_threads
+
+    def worker(tid: int):
+        solver = ALNSPSOSolver(
+            inst,
+            max_iter=max_iter,
+            pso_freq=pso_freq,
+            pso_particles=pso_particles,
+            pso_iter=pso_iter,
+        )
+        sol, hist = solver.solve_parallel_worker(
+            pool=pool,
+            thread_id=tid,
+            push_freq=push_freq,
+            stagnation_limit=stagnation_limit,
+            verbose=verbose,
+        )
+        thread_results[tid] = (sol, hist)
+        if verbose:
+            cost = compute_cost(sol, inst)
+            print(f"  [线程 {tid+1}/{num_threads}] 完成，本地最优: {cost:.4f}")
+
+    for tid in range(num_threads):
+        t = threading.Thread(target=worker, args=(tid,), daemon=True)
+        threads.append(t)
+
+    # 所有线程同时启动
+    for t in threads:
+        t.start()
+
+    # 等待所有线程完成
+    for t in threads:
+        t.join()
+
+    if verbose:
+        print(f"\n{pool.stats()}")
+
+    # 取全局最优解
+    best_sol, best_cost = pool.global_best()
+
+    # 若公共池为空（理论上不应发生），回退到各线程本地最优
+    if best_sol is None:
+        for res in thread_results:
+            if res is not None:
+                sol, hist = res
+                c = compute_cost(sol, inst)
+                if c < best_cost:
+                    best_sol = sol
+                    best_cost = c
+
+    # 合并所有线程的 best_cost_history 取每步最小值作为收敛曲线
+    all_hists = [res[1] for res in thread_results if res is not None]
+    if all_hists:
+        max_len = max(len(h) for h in all_hists)
+        # 补齐长度（末尾填充最后值）
+        padded = [h + [h[-1]] * (max_len - len(h)) for h in all_hists]
+        merged_hist = [min(padded[t][i] for t in range(len(padded)))
+                       for i in range(max_len)]
+    else:
+        merged_hist = []
+
+    if verbose:
+        print(f"并行求解完成！全局最优费用: {best_cost:.4f}")
+
+    return best_sol, merged_hist
+
+
+# ============================================================
+# 10. 结果输出与可视化
+# ============================================================
+
+def print_solution_detail(sol: Solution, inst: Instance, solve_time: float = None):
     """打印解的详细信息"""
     print("\n" + "="*60)
     print("解的详细信息")
@@ -1670,6 +1968,8 @@ def print_solution_detail(sol: Solution, inst: Instance):
     depot_x, depot_y = inst.node_coord(inst.depot_idx)
 
     print(f"\n总费用: {total_cost:.4f} 元")
+    if solve_time is not None:
+        print(f"求解用时: {solve_time:.2f} 秒")
     print(f"电池容量: {inst.battery:.1f} m")
 
     # 断点信息
@@ -1920,7 +2220,7 @@ def plot_solution(sol: Solution, inst: Instance, output_path: str,
 
 
 def save_solution_txt(sol: Solution, inst: Instance, output_path: str,
-                      cost_history: List[float]):
+                      cost_history: List[float], solve_time: float = None):
     """保存解到txt文件"""
     total_cost = compute_cost(sol, inst)
     depot_x, depot_y = inst.node_coord(inst.depot_idx)
@@ -1930,6 +2230,8 @@ def save_solution_txt(sol: Solution, inst: Instance, output_path: str,
         f.write("ALNS+PSO 求解结果\n")
         f.write("="*60 + "\n")
         f.write(f"\n总费用: {total_cost:.6f} 元\n")
+        if solve_time is not None:
+            f.write(f"求解用时: {solve_time:.2f} 秒\n")
         f.write(f"初始解费用: {cost_history[0]:.6f} 元\n")
         f.write(f"改进率: {(cost_history[0] - total_cost) / cost_history[0] * 100:.2f}%\n")
 
@@ -2070,10 +2372,17 @@ def solve_instance(instance_path: str,
                    pso_freq: int = 50,
                    pso_particles: int = 15,
                    pso_iter: int = 20,
+                   num_threads: int = 1,
+                   push_freq: int = 50,
+                   stagnation_limit: int = 100,
                    verbose: bool = True) -> Tuple[Solution, float]:
     """
     对单个算例文件运行 ALNS+PSO 求解。
     默认输出目录：将路径中的 '算例' 替换为 '结果'，保持子目录结构不变。
+
+    num_threads > 1 时启用异步并行搜索：
+      - push_freq:        每隔多少次迭代向公共池推送最优解
+      - stagnation_limit: 连续多少次迭代无改进时从公共池拉取全局最优解
     """
     inst = parse_instance(instance_path)
     basename = os.path.splitext(os.path.basename(instance_path))[0]
@@ -2089,25 +2398,48 @@ def solve_instance(instance_path: str,
         print(f"  路网节点: {inst.num_road_nodes}, 需求边: {inst.num_edges}, "
               f"无人机: {inst.num_drones}")
         print(f"  电池容量: {inst.battery:.1f} m")
+        if num_threads > 1:
+            print(f"  求解模式: 异步并行（{num_threads} 线程，"
+                  f"推送频率={push_freq}，停滞阈值={stagnation_limit}）")
+        else:
+            print(f"  求解模式: 单线程")
         print(f"{'='*60}")
 
-    solver = ALNSPSOSolver(
-        inst,
-        max_iter=max_iter,
-        pso_freq=pso_freq,
-        pso_particles=pso_particles,
-        pso_iter=pso_iter,
-    )
+    t_start = time.time()
 
-    best_sol, cost_history = solver.solve(verbose=verbose)
+    if num_threads > 1:
+        # 异步并行模式
+        best_sol, cost_history = parallel_solve(
+            inst,
+            num_threads=num_threads,
+            max_iter=max_iter,
+            push_freq=push_freq,
+            stagnation_limit=stagnation_limit,
+            pso_freq=pso_freq,
+            pso_particles=pso_particles,
+            pso_iter=pso_iter,
+            verbose=verbose,
+        )
+    else:
+        # 单线程模式（原有逻辑）
+        solver = ALNSPSOSolver(
+            inst,
+            max_iter=max_iter,
+            pso_freq=pso_freq,
+            pso_particles=pso_particles,
+            pso_iter=pso_iter,
+        )
+        best_sol, cost_history = solver.solve(verbose=verbose)
+
+    solve_time = time.time() - t_start
     best_cost = compute_cost(best_sol, inst)
 
     if verbose:
-        print_solution_detail(best_sol, inst)
+        print_solution_detail(best_sol, inst, solve_time=solve_time)
 
     # 保存结果文件（文件名与算例文件名相同，仅目录改为 结果/...）
     txt_path = os.path.join(output_dir, f"{basename}.txt")
-    save_solution_txt(best_sol, inst, txt_path, cost_history)
+    save_solution_txt(best_sol, inst, txt_path, cost_history, solve_time=solve_time)
 
     # 收敛曲线
     conv_path = os.path.join(output_dir, f"{basename}_convergence.png")
@@ -2163,6 +2495,24 @@ if __name__ == "__main__":
         help="PSO迭代次数（默认20）"
     )
     parser.add_argument(
+        "--num_threads", "-j",
+        type=int,
+        default=1,
+        help="并行线程数（默认1=单线程；>1 启用异步并行搜索）"
+    )
+    parser.add_argument(
+        "--push_freq",
+        type=int,
+        default=50,
+        help="并行模式：每隔多少次迭代向公共池推送最优解（默认50）"
+    )
+    parser.add_argument(
+        "--stagnation_limit",
+        type=int,
+        default=100,
+        help="并行模式：连续多少次迭代无改进时从公共池拉取全局最优解（默认100）"
+    )
+    parser.add_argument(
         "--batch",
         action="store_true",
         help="批量求解某目录下所有算例"
@@ -2200,6 +2550,9 @@ if __name__ == "__main__":
                     pso_freq=args.pso_freq,
                     pso_particles=args.pso_particles,
                     pso_iter=args.pso_iter,
+                    num_threads=args.num_threads,
+                    push_freq=args.push_freq,
+                    stagnation_limit=args.stagnation_limit,
                     verbose=False,
                 )
                 results.append((os.path.basename(fp), out_dir, cost, True))
@@ -2239,6 +2592,9 @@ if __name__ == "__main__":
             pso_freq=args.pso_freq,
             pso_particles=args.pso_particles,
             pso_iter=args.pso_iter,
+            num_threads=args.num_threads,
+            push_freq=args.push_freq,
+            stagnation_limit=args.stagnation_limit,
             verbose=True,
         )
 
