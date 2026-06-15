@@ -284,7 +284,7 @@ DEPOT_DIRECTIONS = [
 
 NUM_INSTANCES_PER_CONFIG = 3
 
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "算例", "大规模算例")
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "算例", "随机算例", "2-Large")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ============================================================

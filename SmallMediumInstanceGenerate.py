@@ -292,9 +292,9 @@ DEPOT_DIRECTIONS = [
 # 每组配置生成的随机实例数
 NUM_INSTANCES_PER_CONFIG = 1
 
-# 输出目录（按规模分别存放）
-OUTPUT_DIR_SMALL  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "算例", "小规模算例")
-OUTPUT_DIR_MEDIUM = os.path.join(os.path.dirname(os.path.abspath(__file__)), "算例", "中等规模算例")
+# 输出目录（按规模分别存放，当前均为随机算例）
+OUTPUT_DIR_SMALL  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "算例", "随机算例", "0-Small")
+OUTPUT_DIR_MEDIUM = os.path.join(os.path.dirname(os.path.abspath(__file__)), "算例", "随机算例", "1-Medium")
 os.makedirs(OUTPUT_DIR_SMALL,  exist_ok=True)
 os.makedirs(OUTPUT_DIR_MEDIUM, exist_ok=True)
 
@@ -346,5 +346,5 @@ if __name__ == "__main__":
     s2, f2 = generate_for_configs(MEDIUM_CONFIGS, OUTPUT_DIR_MEDIUM, "中等规模")
 
     print(f"\n全部完成：")
-    print(f"  小规模算例  → {OUTPUT_DIR_SMALL}  ({s1} 个文件, {f1} 张图)")
-    print(f"  中等规模算例 → {OUTPUT_DIR_MEDIUM} ({s2} 个文件, {f2} 张图)")
+    print(f"  0-Small  → {OUTPUT_DIR_SMALL}  ({s1} 个文件, {f1} 张图)")
+    print(f"  1-Medium → {OUTPUT_DIR_MEDIUM} ({s2} 个文件, {f2} 张图)")
