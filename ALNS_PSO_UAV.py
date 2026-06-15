@@ -2350,7 +2350,7 @@ def save_solution_txt(sol: Solution, inst: Instance, output_path: str,
 def _mirror_output_dir(instance_path: str, src_root: str = "算例", dst_root: str = "结果") -> str:
     """
     将算例路径中的根目录名替换为结果根目录名，保持子目录结构。
-    例如：.../算例/小中规模算例/ → .../结果/小中规模算例/
+    例如：.../算例/小规模算例/ → .../结果/小规模算例/
     若路径中不含 src_root，则回退为与算例同级目录。
     """
     abs_path = os.path.abspath(instance_path)
@@ -2569,10 +2569,10 @@ if __name__ == "__main__":
     else:
         # 单算例模式
         if args.instance is None:
-            # 默认使用小中规模算例
+            # 默认使用小规模算例
             default_dir = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
-                "算例", "小中规模算例"
+                "算例", "小规模算例"
             )
             candidates = [f for f in os.listdir(default_dir) if f.endswith('.txt')]
             if candidates:

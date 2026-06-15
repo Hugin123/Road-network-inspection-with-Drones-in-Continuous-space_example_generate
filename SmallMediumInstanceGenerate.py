@@ -264,16 +264,21 @@ COORD_MULTIPLIER = 250
 NUM_DRONES = 2
 
 # 每组 (路网节点数, 目标边数)
-SMALL_MEDIUM_CONFIGS = [
-    # (road_nodes, edges)
-    (4,  3),
-    (5,  4),
-    (6,  5),
-    (6,  6),
-    (6,  7),
+# 小规模算例：5-10 个节点
+SMALL_CONFIGS = [
+    (4,  5),
+    (5,  7),
+    (6,  8),
+    (9,  13),
 ]
 
-MODES = ["grid"]   # 小中规模使用 grid 模式
+# 中等规模算例：10-20 个节点
+MEDIUM_CONFIGS = [
+    (15, 22),
+    (19, 28),
+]
+
+MODES = ["grid"]   # 使用 grid 模式
 
 # 基站方向标签
 DEPOT_DIRECTIONS = [
@@ -287,29 +292,32 @@ DEPOT_DIRECTIONS = [
 # 每组配置生成的随机实例数
 NUM_INSTANCES_PER_CONFIG = 1
 
-# 输出目录
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "算例", "小中规模算例")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# 输出目录（按规模分别存放）
+OUTPUT_DIR_SMALL  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "算例", "小规模算例")
+OUTPUT_DIR_MEDIUM = os.path.join(os.path.dirname(os.path.abspath(__file__)), "算例", "中等规模算例")
+os.makedirs(OUTPUT_DIR_SMALL,  exist_ok=True)
+os.makedirs(OUTPUT_DIR_MEDIUM, exist_ok=True)
 
 # ============================================================
 # 主生成逻辑
 # ============================================================
-if __name__ == "__main__":
+def generate_for_configs(configs, output_dir, label):
+    """对给定配置列表批量生成算例并保存到指定目录"""
     total_saved = 0
     total_figs  = 0
+    os.makedirs(output_dir, exist_ok=True)
     for mode in MODES:
-        for (road_nodes, edges) in SMALL_MEDIUM_CONFIGS:
+        for (road_nodes, edges) in configs:
             for inst_idx in range(NUM_INSTANCES_PER_CONFIG):
-                print(f"\n生成路网: mode={mode}, nodes={road_nodes}, edges={edges}, 实例#{inst_idx}")
+                print(f"\n[{label}] 生成路网: mode={mode}, nodes={road_nodes}, edges={edges}, 实例#{inst_idx}")
                 G, pos = generate_strict_road_network(mode, road_nodes, edges)
                 actual_edges = G.number_of_edges()
                 if actual_edges == 0:
                     print(f"  警告：路网边数为0，跳过。")
                     continue
 
-                # 坐标乘以缩放倍数（路网生成后再缩放，不影响码冲检测）
+                # 坐标乘以缩放倍数
                 scaled_pos = {k: v * COORD_MULTIPLIER for k, v in pos.items()}
-
                 total_nodes = road_nodes + 1
 
                 # 收集5种基站位置，用于统一绘图
@@ -321,14 +329,22 @@ if __name__ == "__main__":
                     if SAVE_TXT:
                         filename = (f"{total_nodes}-{actual_edges}-{NUM_DRONES}"
                                     f"-{depot_id}-({inst_idx}).txt")
-                        filepath = os.path.join(OUTPUT_DIR, filename)
+                        filepath = os.path.join(output_dir, filename)
                         save_instance(filepath, G, scaled_pos, depot_pos, NUM_DRONES)
                         total_saved += 1
 
                 if SAVE_PNG:
                     fig_name = f"{total_nodes}-{actual_edges}-{NUM_DRONES}-({inst_idx}).png"
-                    fig_path = os.path.join(OUTPUT_DIR, fig_name)
+                    fig_path = os.path.join(output_dir, fig_name)
                     save_network_figure(fig_path, G, scaled_pos, all_depot_positions)
                     total_figs += 1
+    return total_saved, total_figs
 
-    print(f"\n全部完成，共保存 {total_saved} 个算例文件、{total_figs} 张路网图到: {OUTPUT_DIR}")
+
+if __name__ == "__main__":
+    s1, f1 = generate_for_configs(SMALL_CONFIGS,  OUTPUT_DIR_SMALL,  "小规模")
+    s2, f2 = generate_for_configs(MEDIUM_CONFIGS, OUTPUT_DIR_MEDIUM, "中等规模")
+
+    print(f"\n全部完成：")
+    print(f"  小规模算例  → {OUTPUT_DIR_SMALL}  ({s1} 个文件, {f1} 张图)")
+    print(f"  中等规模算例 → {OUTPUT_DIR_MEDIUM} ({s2} 个文件, {f2} 张图)")

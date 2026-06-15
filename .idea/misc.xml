@@ -3,5 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="Python 3.12 (RoadNetworkInspection)" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="D:\ProgramData\Anaconda\envs\python3.9" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="$USER_HOME$/miniforge3" project-jdk-type="Python SDK" />
 </project>

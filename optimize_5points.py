@@ -1,158 +1,390 @@
 """
-求解优化问题:
-最小化 ||p1p4||_2 + ||p2p4||_2 + ||p3p5||_2 - ||p1p3||_2 - ||p2p5||_2
+目标: g = d(p1,p5) - d(p1,p4) - d(p3,p5) >= 0
+p4=(x4,0) 固定在线段[0,200]等分20段的19个非端点 (x4=10,...,190)
+p5=(200,0) 固定
+p1=(x1,y1), p3=(x3,y3) 在平面自由移动
 
-约束:
-  x1, x2 in [x_min, 400]   (x_min 作为参数扫描)
-  x3 in [0, 200]
-  x4 in [0, 200]
-  x5 = 200 (固定)
-  |y1| in [y_min, 200]     (y_min 作为参数扫描)
-  |y2| in [y_min, 200]
-  |y3| in [0, 200]
-  y4 = 0, y5 = 0 (固定)
+核心推导（修正版，含 y1 的完整分析）:
 
-二维扫描 x_min 和 y_min，输出目标函数最小值矩阵
+g >= 0  等价于  d(p1,p5) - d(p1,p4) >= d(p3,p5)
+
+令 Δ(x1,y1) = d(p1,p5) - d(p1,p4)，D35 = d(p3,p5)
+
+━━ 关键观察 ━━
+
+1. Δ 的符号（必要条件）:
+   d(p1,p5)² - d(p1,p4)² = (x1-200)² - (x1-x4)²  （y1² 消去！）
+                          = -(200-x4)·(2x1-x4-200)
+   Δ >= 0 <=> x1 <= (x4+200)/2  [只与 x1 有关，y1 无影响]
+
+2. Δ 的大小随 y1 变化:
+   当 x1 固定时，|y1| 增大会使 Δ 减小（两者距离差趋向0）
+   Δ 在 y1=0 时取最大值: Δ_max = |x1-200| - |x1-x4| (y1=0)
+   因此 y1=0 时 g 最容易满足，|y1| 越大越难满足
+
+3. 充要条件（含 y1）:
+   sqrt[(x1-200)²+y1²] - sqrt[(x1-x4)²+y1²] >= D35
+
+   两边+右移: sqrt[(x1-200)²+y1²] >= D35 + sqrt[(x1-x4)²+y1²]
+   两边平方（需右边>=0，即 D35+d14>=0 恒成立）:
+   (x1-200)²+y1² >= D35²+2*D35*sqrt[(x1-x4)²+y1²]+(x1-x4)²+y1²
+   (x1-200)²-(x1-x4)² - D35² >= 2*D35*sqrt[(x1-x4)²+y1²]
+   M - D35² >= 2*D35*d(p1,p4)    其中 M = (200-x4)(x4+200-2x1)
+
+   需要 M-D35² >= 0（否则左边 < 0 而右边 >= 0 矛盾）
+   再次平方:
+   (M-D35²)² >= 4*D35²*d(p1,p4)²
+   (M-D35²)² >= 4*D35²*[(x1-x4)²+y1²]
+
+   ★ 充要条件（D35>0）:
+     M >= D35²   [x1 的约束]
+     AND y1² <= (M-D35²)²/(4*D35²) - (x1-x4)²  [y1 的约束]
+   其中 M = (200-x4)·(x4+200-2*x1)
+
+   展开 M >= D35²:
+     x1 <= (x4+200)/2 - D35²/[2(200-x4)]
+
+   展开 y1 约束:
+     y1² <= [(M-D35²)/(2*D35)]² - (x1-x4)²
+
+   ★ 两个条件缺一不可，y1 也有约束！
 """
 
-import sys
-
 import numpy as np
-from scipy.optimize import minimize
-
 
 def dist(ax, ay, bx, by):
-    return np.sqrt((ax - bx) ** 2 + (ay - by) ** 2)
+    return np.sqrt((ax-bx)**2 + (ay-by)**2)
 
+def g_val(x1, y1, x3, y3, x4):
+    """g = d(p1,p5) - d(p1,p4) - d(p3,p5)"""
+    return dist(x1,y1,200,0) - dist(x1,y1,x4,0) - dist(x3,y3,200,0)
 
-def compute_obj(x1, y1, x2, y2, x3, y3, x4):
-    d14 = dist(x1, y1, x4, 0)
-    d24 = dist(x2, y2, x4, 0)
-    d35 = dist(x3, y3, 200, 0)
-    d13 = dist(x1, y1, x3, y3)
-    d25 = dist(x2, y2, 200, 0)
-    return d14 + d24 + d35 - d13 - d25
+def g_conditions(x1, y1, x4, D35):
+    """
+    检查 (x1,y1) 是否满足 g >= 0 的充要条件（给定 x4, D35）
+    返回 (cond1, cond2, g_actual)
+    cond1: M >= D35²  (x1条件)
+    cond2: y1² <= [(M-D35²)/(2D35)]²-(x1-x4)²  (y1条件)
+    """
+    M = (200-x4) * (x4+200-2*x1)
+    cond1 = (M >= D35**2)
+    if D35 > 0 and cond1:
+        y1_max_sq = ((M - D35**2)/(2*D35))**2 - (x1-x4)**2
+        cond2 = (y1**2 <= y1_max_sq + 1e-9)
+    elif D35 == 0:
+        cond2 = True  # D35=0 时 y1 无约束
+    else:
+        cond2 = False  # M < D35² 时条件不满足
+    return cond1, cond2
 
+x4_positions = list(range(10, 200, 10))
 
-def solve(x_min, y_min):
-    """给定 x_min, y_min，求最小目标函数值（多结构启发式 + 随机搜索）"""
-    u_lo = float(y_min)
-    u_hi = 200.0
-    x_lo = float(x_min)
-    u_mid = (u_lo + u_hi) / 2 if u_lo < u_hi else u_lo
+print("=" * 80)
+print("g = d(p1,p5) - d(p1,p4) - d(p3,p5) >= 0 的充要条件分析")
+print("p4=(x4,0), p5=(200,0) 固定，p1=(x1,y1), p3=(x3,y3) 自由")
+print("=" * 80)
 
-    bounds = [
-        (x_lo, 400),    # x1
-        (x_lo, 400),    # x2
-        (0, 200),       # x3
-        (0, 200),       # x4
-        (u_lo, u_hi),   # u1 = |y1|
-        (u_lo, u_hi),   # u2 = |y2|
-        (-200, 200),    # y3
-    ]
+# ============================================================
+# Part 1: 完整解析推导
+# ============================================================
+print("""
+【Part 1】完整解析推导
+================================================================================
 
-    def objective(vars, s1, s2):
-        x1, x2, x3, x4, u1, u2, y3 = vars
-        y1 = s1 * u1
-        y2 = s2 * u2
-        return compute_obj(x1, y1, x2, y2, x3, y3, x4)
+设 D35 = d(p3,p5) = sqrt[(x3-200)²+y3²]（已知量，由 p3 决定）
 
-    # 多种启发式结构的初始点
-    u_vals = list({u_lo, u_mid, u_hi})
-    starts = []
+g >= 0
+<=> d(p1,p5) - d(p1,p4) >= D35
+<=> sqrt[(x1-200)²+y1²] - sqrt[(x1-x4)²+y1²] >= D35
 
-    # 结构1: p1=p2=x_min, p3=p5, p4=0  (x_min小时最优)
-    for uv in u_vals:
-        for x4v in [0, 100, 200]:
-            starts.append([x_lo, x_lo, 200, x4v, uv, uv, 0.0])
-            starts.append([x_lo, x_lo, 0,   x4v, uv, uv, 0.0])
+━━ 第一步：必要条件 x1 <= (x4+200)/2 ━━
 
-    # 结构2: p1=x_min, p2=400 (x1最小，p2最大距p5)
-    for uv in u_vals:
-        for x4v in [0, 100, 200]:
-            for x3v in [0, 50, 200]:
-                starts.append([x_lo, 400, x3v, x4v, uv, u_lo, 0.0])
-                starts.append([x_lo, 400, x3v, x4v, u_lo, uv, 0.0])
+  d(p1,p5)²-d(p1,p4)² = (x1-200)²-(x1-x4)²   （y1² 消去）
+                       = -(200-x4)·(2x1-x4-200)
 
-    # 结构3: p2=400, p5=(200,0), p2p5方向 (p2尽量远离p5)
-    for uv in u_vals:
-        starts.append([400, 400, 200, 0,   uv, uv, 0.0])
-        starts.append([400, 400, 0,   0,   uv, uv, 0.0])
-        starts.append([x_lo, 400, 200, 0,  uv, uv, 0.0])
+  Δ >= 0 必要 => d(p1,p5)² >= d(p1,p4)² => x1 <= (x4+200)/2
+  ★ 此必要条件只含 x1，y1 无关
 
-    # 结构4: p1,p2同侧 y 方向相反 (s1=-1, s2=+1 时有效)
-    for uv in u_vals:
-        for x4v in [0, 100, 200]:
-            starts.append([x_lo, x_lo, 200, x4v, uv, uv, 50.0])
+━━ 第二步：在 x1 <= (x4+200)/2 前提下，推导 y1 的约束 ━━
 
-    # 随机点
-    rng = np.random.default_rng(int(abs(x_min * 3 + y_min * 7)) % (2 ** 31))
-    for _ in range(30):
-        starts.append([
-            rng.uniform(x_lo, 400), rng.uniform(x_lo, 400),
-            rng.uniform(0, 200), rng.uniform(0, 200),
-            rng.uniform(u_lo, u_hi), rng.uniform(u_lo, u_hi),
-            rng.uniform(-200, 200),
-        ])
+  令 M = (200-x4)·(x4+200-2x1) > 0  （当 x1 < (x4+200)/2 时）
+  注意: d(p1,p5)²-d(p1,p4)² = M（与 y1 无关！）
 
-    best_val = np.inf
-    for s1 in [+1, -1]:
-        for s2 in [+1, -1]:
-            def obj(v, _s1=s1, _s2=s2):
-                return objective(v, _s1, _s2)
-            for x0_raw in starts:
-                x0 = np.clip(np.array(x0_raw, dtype=float),
-                             [lo for lo, hi in bounds],
-                             [hi for lo, hi in bounds])
-                try:
-                    res = minimize(obj, x0, method='L-BFGS-B', bounds=bounds,
-                                   options={'maxiter': 500, 'ftol': 1e-15, 'gtol': 1e-12})
-                    if res.fun < best_val:
-                        best_val = res.fun
-                except:
-                    pass
-    return best_val
+  g >= 0 等价于（移项后两边平方，需分步骤保证等价性）:
+    sqrt[(x1-200)²+y1²] >= D35 + sqrt[(x1-x4)²+y1²]
+  两边非负，平方:
+    (x1-200)²+y1² >= D35²+2*D35*d(p1,p4)+(x1-x4)²+y1²
+    M - D35² >= 2*D35*d(p1,p4)    ... (**)
 
+  (**) 要求: M >= D35²（否则左边<0而右边>=0，矛盾）
+    => x1 <= (x4+200)/2 - D35²/[2(200-x4)]    ... (条件A)
 
-# =============================================
-# 二维扫描参数
-# x_min: -200 到 400，步长 50（13个值）
-# y_min:    0 到 200，步长 25（ 9个值）
-# =============================================
-x_min_list = list(range(-200, 401, 50))
-y_min_list = list(range(0, 201, 25))
+  在条件A成立时，(**) 两边非负，再次平方:
+    (M-D35²)² >= 4*D35²·d(p1,p4)²
+    (M-D35²)² >= 4*D35²·[(x1-x4)²+y1²]
+    y1² <= (M-D35²)²/[4*D35²] - (x1-x4)²      ... (条件B)
+    即 y1² <= [(M-D35²)/(2*D35)]² - (x1-x4)²
 
-print("=" * 100)
-print("二维扫描: min ||p1p4|| + ||p2p4|| + ||p3p5|| - ||p1p3|| - ||p2p5||")
-print("行: x_min (x1,x2下界, -200~400步长50)    列: y_min (|y1|,|y2|下界, 0~200步长25)")
-print("x3∈[0,200], x4∈[0,200], x5=200(固定), y4=y5=0(固定)")
-print("=" * 100)
+  ★★★ 充要条件（D35 > 0）= 条件A AND 条件B ★★★
 
-col_title = "x_min\\y_min"
-header = f"{col_title:>12}" + "".join(f"{y:>10}" for y in y_min_list)
-sep = "-" * len(header)
-print(header)
-print(sep)
-sys.stdout.flush()
+    条件A: x1 <= (x4+200)/2 - D35²/[2(200-x4)]
+    条件B: y1² <= [(M-D35²)/(2*D35)]² - (x1-x4)²
+           其中 M = (200-x4)·(x4+200-2x1)
 
-matrix = np.full((len(x_min_list), len(y_min_list)), np.nan)
+  当 D35 = 0（p3=p5）：条件退化为 x1 <= (x4+200)/2，y1 无约束
 
-for i, x_min in enumerate(x_min_list):
-    for j, y_min in enumerate(y_min_list):
-        matrix[i, j] = solve(x_min, y_min)
-    row = f"{x_min:>12}" + "".join(f"{matrix[i,j]:>10.3f}" for j in range(len(y_min_list)))
-    print(row, flush=True)
+━━ 第三步：y1 约束的几何解释 ━━
 
-# 相对变化矩阵
-print("\n" + "=" * 100)
-print("【相对基准变化量矩阵】(基准: x_min=-200, y_min=0 处的值)")
-base = matrix[0, 0]
-print(f"基准值 = {base:.3f}")
-print(header)
-print(sep)
-for i, x_min in enumerate(x_min_list):
-    row = f"{x_min:>12}" + "".join(f"{matrix[i,j]-base:>+10.3f}" for j in range(len(y_min_list)))
+  条件B: y1² <= [(M-D35²)/(2*D35)]² - (x1-x4)²
+
+  令 R = (M-D35²)/(2*D35)，则 y1² + (x1-x4)² <= R²
+  这是以 p4=(x4,0) 为圆心、半径 R 的圆！
+
+  ★★ 几何含义: p1 在以 p4 为圆心、半径 R=(M-D35²)/(2*D35) 的圆内
+     其中 M = d(p1_on_xaxis, p5)² - d(p1_on_xaxis, p4)²... 不对
+
+  更准确: R = [(200-x4)(x4+200-2x1)-D35²] / [2*D35]
+  R 依赖 x1，所以这不是一个简单的圆约束
+
+  换一种写法: 以 x1 和 y1 为变量的约束域是什么形状？
+
+  展开条件B:
+    4*D35²*y1² <= (M-D35²)² - 4*D35²*(x1-x4)²
+  代入 M = (200-x4)(x4+200-2x1):
+    4*D35²*y1² + 4*D35²*(x1-x4)² <= [(200-x4)(x4+200-2x1) - D35²]²
+
+  左边 = 4*D35²*[(x1-x4)²+y1²] = 4*D35²*d(p1,p4)²
+
+  所以条件B等价于:
+    2*D35*d(p1,p4) <= (200-x4)(x4+200-2x1) - D35²
+  即: 2*D35*d(p1,p4) + D35² <= M
+  即: D35*(2*d(p1,p4)+D35) <= M = d(p1,p5)²-d(p1,p4)²
+  即: D35*(d(p1,p4)+D35+d(p1,p4)) <= [d(p1,p5)-d(p1,p4)]·[d(p1,p5)+d(p1,p4)]
+
+  这正好来自于原式！（验证推导一致）
+
+━━ 第四步：p3 的约束 ━━
+
+  g >= 0 <=> D35 <= d(p1,p5)-d(p1,p4)  = Δ(x1,y1)
+
+  p3 的充要约束: d(p3,p5) <= Δ(x1,y1)
+  即: (x3-200)²+y3² <= Δ(x1,y1)²  = [d(p1,p5)-d(p1,p4)]²
+  ★ x3 和 y3 都出现，约束为以 p5 为圆心的圆
+
+━━ 汇总 ━━
+""")
+
+# ============================================================
+# Part 2: 数值验证（修正后的充要条件）
+# ============================================================
+print("【Part 2】数值验证修正后的充要条件")
+print("=" * 80)
+print("固定 x4=100, D35=50（p3=(150,0)）")
+print()
+print("条件A: x1 <= 150 - 50²/[2*100] = 150-12.5 = 137.5")
+print("条件B: y1² <= [(M-50²)/(100)]² - (x1-100)²")
+print("       其中 M = 100*(300-2*x1)")
+print()
+
+x4_v, D35_v = 100, 50.0
+x3_v, y3_v = 150.0, 0.0
+
+print(f"{'x1':>8} {'y1':>8} | {'条件A':>6} {'M':>8} {'条件B':>6} | {'g值':>10} {'g>=0':>6}")
+print("-" * 65)
+for x1t in [80, 100, 120, 137.5, 138, 150]:
+    M_t = (200-x4_v)*(x4_v+200-2*x1t)
+    condA = (M_t >= D35_v**2)
+    for y1t in [0, 30, 50, 100, 150]:
+        if condA:
+            y1_max_sq = ((M_t-D35_v**2)/(2*D35_v))**2 - (x1t-x4_v)**2
+            condB = (y1t**2 <= y1_max_sq + 1e-9) if y1_max_sq >= 0 else False
+        else:
+            condB = False
+        gv = g_val(x1t, y1t, x3_v, y3_v, x4_v)
+        both = condA and condB
+        print(f"{x1t:>8.1f} {y1t:>8.1f} | {'YES' if condA else 'NO':>6} {M_t:>8.1f} {'YES' if condB else 'NO':>6} | {gv:>10.4f} {'YES' if gv>=0 else 'NO':>6}")
+    print()
+
+# ============================================================
+# Part 3: y1 的临界值（给定 x1 和 D35）
+# ============================================================
+print("【Part 3】y1 的允许范围（给定 x1 和 D35）")
+print("=" * 80)
+print("条件B 给出 y1 的上界: |y1| <= y1_max = sqrt{[(M-D35²)/(2*D35)]² - (x1-x4)²}")
+print("(M-D35²)/(2*D35) 即 p1 在 x 轴时（y1=0）的 g 值/(2*D35) ... 实则是 d14 的临界半径")
+print()
+print("几何含义: p1 必须在以 p4 为圆心、某半径 R(x1) 的圆内")
+print("  R(x1) = (M-D35²)/(2*D35) = [(200-x4)(x4+200-2x1)-D35²]/(2*D35)")
+print()
+
+x4_t = 100
+D35_t = 50.0
+print(f"x4={x4_t}, D35={D35_t}:")
+print(f"{'x1':>8} | {'M':>10} | {'R=(M-D35²)/(2D35)':>22} | {'y1_max':>10} | {'g(y1=0)':>10} | {'g(y1=y1_max)':>14}")
+print("-" * 85)
+for x1t in [0, 50, 80, 100, 120, 130, 137.5]:
+    M_t = (200-x4_t)*(x4_t+200-2*x1t)
+    if M_t >= D35_t**2:
+        R = (M_t - D35_t**2) / (2*D35_t)
+        r_sq = R**2 - (x1t - x4_t)**2
+        y1_max = np.sqrt(max(0, r_sq))
+        g0 = g_val(x1t, 0,      x3_v, y3_v, x4_t)
+        gy = g_val(x1t, y1_max, x3_v, y3_v, x4_t)
+    else:
+        R = float('nan')
+        y1_max = 0.0
+        g0 = g_val(x1t, 0, x3_v, y3_v, x4_t)
+        gy = float('nan')
+    print(f"{x1t:>8.1f} | {M_t:>10.1f} | {R:>22.4f} | {y1_max:>10.4f} | {g0:>10.4f} | {gy:>14.6f}")
+
+# ============================================================
+# Part 4: 汇总表——每个 x4 下的 x1_upper 和 y1_max（对不同 D35）
+# ============================================================
+print("\n\n【Part 4】汇总表: x1 上界和 y1 上界（在 y1=0 时的 p1 点）")
+print("=" * 80)
+print("公式:")
+print("  x1_upper = (x4+200)/2 - D35²/[2(200-x4)]")
+print("  y1_max(x1) = sqrt{[(M-D35²)/(2*D35)]² - (x1-x4)²}  其中 M=(200-x4)(x4+200-2*x1)")
+print("  特别地，在 x1=0 时 y1_max 最大，在 x1=x1_upper 时 y1_max=0")
+print()
+
+# 对每个 x4，展示 D35=50 时的 x1 上界和 y1 在 x1=0 时的最大允许值
+D35_show = [0, 20, 50, 100, 150]
+print(f"{'x4':>6} | " + " | ".join(f"{'D35='+str(d)+'  x1_up':>14}" for d in D35_show))
+print("-" * (6 + 3 + len(D35_show)*17))
+for x4 in x4_positions:
+    row = f"{x4:>6} | "
+    parts = []
+    for D35 in D35_show:
+        x1_up = (x4+200)/2 - D35**2/(2*(200-x4))
+        parts.append(f"{x1_up:>14.1f}")
+    row += " | ".join(parts)
     print(row)
 
-print("\n规律: 正值越大 => 约束越紧 => 目标函数值越高（负收益越小）")
+print()
+print(f"{'x4':>6} | " + " | ".join(f"{'D35='+str(d)+' y1_max(x1=0)':>18}" for d in [0,20,50,100]))
+print("-" * (6 + 3 + 4*21))
+for x4 in x4_positions:
+    row = f"{x4:>6} | "
+    parts = []
+    for D35 in [0, 20, 50, 100]:
+        if D35 == 0:
+            parts.append(f"{'inf (无约束)':>18}")
+        else:
+            x1_v = 0.0  # 取 x1=0
+            M_v = (200-x4)*(x4+200-2*x1_v)
+            if M_v >= D35**2:
+                R = (M_v - D35**2) / (2*D35)
+                r_sq = R**2 - (x1_v - x4)**2
+                y1_max = np.sqrt(max(0, r_sq))
+                parts.append(f"{y1_max:>18.2f}")
+            else:
+                parts.append(f"{'不可行':>18}")
+    row += " | ".join(parts)
+    print(row)
+
+# ============================================================
+# Part 5: 大规模随机验证（修正后的充要条件）
+# ============================================================
+print("\n\n【Part 5】大规模随机验证修正后的充要条件")
+print("=" * 80)
+rng = np.random.default_rng(42)
+n_tests = 300000
+
+for x4 in [50, 100, 150]:
+    correct_pos = 0
+    wrong_pos   = 0
+    correct_neg = 0
+    wrong_neg   = 0
+
+    for _ in range(n_tests):
+        x1 = rng.uniform(-200, 400)
+        y1 = rng.uniform(-200, 200)
+        x3 = rng.uniform(-200, 400)
+        y3 = rng.uniform(-200, 200)
+        D35 = dist(x3, y3, 200, 0)
+
+        M = (200-x4)*(x4+200-2*x1)
+        condA = (M >= D35**2)
+        if condA and D35 > 0:
+            R_sq = ((M-D35**2)/(2*D35))**2 - (x1-x4)**2
+            condB = (y1**2 <= R_sq + 1e-9) if R_sq >= 0 else False
+        elif condA and D35 == 0:
+            condB = True
+        else:
+            condB = False
+        satisfies = condA and condB
+
+        gv = g_val(x1, y1, x3, y3, x4)
+        g_pos = (gv >= -1e-9)
+
+        if satisfies and g_pos:     correct_pos += 1
+        elif satisfies and not g_pos: wrong_pos += 1
+        elif not satisfies and not g_pos: correct_neg += 1
+        else: wrong_neg += 1
+
+    total_sat = correct_pos + wrong_pos
+    total_unsat = correct_neg + wrong_neg
+    print(f"  x4={x4}:")
+    print(f"    满足充要条件时: {total_sat}次, g>=0 {correct_pos}次(✓), g<0 {wrong_pos}次(✗)")
+    print(f"    不满足条件时:   {total_unsat}次, g<0 {correct_neg}次(✓), g>=0 {wrong_neg}次(✗)")
+    suff = 100*correct_pos/max(1,total_sat)
+    nece = 100*correct_neg/max(1,total_unsat)
+    print(f"    充分性={suff:.2f}%  必要性={nece:.2f}%", flush=True)
+    print()
+
+print("充分性=必要性=100% 说明条件是精确充要条件")
+
+# ============================================================
+# Part 6: 最终结论
+# ============================================================
+print("\n\n【Part 6】最终结论")
+print("=" * 80)
+print("""
+g = d(p1,p5) - d(p1,p4) - d(p3,p5) >= 0  的充要条件:
+
+设 D35 = d(p3,p5)，M = (200-x4)·(x4+200-2*x1)
+
+━━ 当 D35 = 0（即 p3 = p5）━━
+  条件: x1 <= (x4+200)/2
+  y1 无约束
+
+━━ 当 D35 > 0 时 ━━
+
+  条件A（x1 的约束，与 y1 无关）:
+    x1 <= (x4+200)/2 - D35²/[2(200-x4)]
+
+  条件B（y1 的约束，需先满足条件A）:
+    y1² <= [(M-D35²)/(2*D35)]² - (x1-x4)²
+    等价于 d(p1,p4)² <= [(M-D35²)/(2*D35)]²
+    等价于 d(p1,p4) <= (M-D35²)/(2*D35)
+    即: p1 在以 p4=(x4,0) 为圆心、半径 R=(M-D35²)/(2*D35) 的圆内
+
+  ★ 综合几何含义（条件A+B）:
+    p1 的 x 坐标不超过 x1_upper = (x4+200)/2 - D35²/[2(200-x4)]
+    且 p1 在以 p4 为圆心、半径 R=(M-D35²)/(2*D35) 的圆内
+    （当 x1 固定时，y1 的允许范围由 R 决定）
+
+━━ p3 的约束（给定 p1） ━━
+  d(p3,p5) <= d(p1,p5) - d(p1,p4)
+  即: (x3-200)² + y3² <= [d(p1,p5)-d(p1,p4)]²
+  几何: p3 在以 p5=(200,0) 为圆心、半径 Δ=d(p1,p5)-d(p1,p4) 的圆内
+  ★ x3 和 y3 都受约束
+
+━━ 最简洁的充分条件 ━━
+  令 y1 = 0（使 Δ 最大化），则:
+    只需 x1 <= (x4+200)/2 - D35²/[2(200-x4)]（y1=0 时自动满足条件B）
+  令 x1 <= x4（使 Δ = 200-x4 最大化，与 y1 无关），则:
+    只需 d(p3,p5) <= 200-x4
+    即 p3 在以 p5 为圆心、半径 200-x4 的圆内
+""")
+
+# 打印最终汇总表
+print("━━ 每个 x4 下的关键参数 ━━")
+print(f"{'x4':>6} | {'Δmax=200-x4':>12} | {'D35允许最大值(y1=0,x1<=x4)':>30} | x1_upper(D35=50)")
+print("-" * 75)
+for x4 in x4_positions:
+    delta_max = 200 - x4
+    x1_up_50 = (x4+200)/2 - 50**2/(2*(200-x4))
+    print(f"{x4:>6} | {delta_max:>12.0f} | {delta_max:>30.0f} | {x1_up_50:>17.1f}")
 
