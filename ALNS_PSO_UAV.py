@@ -445,14 +445,22 @@ def get_sub_edge_id(edge_idx: int, seg: int) -> Tuple[int, int]:
 
 
 def greedy_build_solution_from_breakpoints(
-    inst: Instance, breakpoints: List[Optional[float]]
+    inst: Instance, breakpoints: List[Optional[float]],
+    max_drones: int = None
 ) -> Solution:
     """
     给定断点配置，构建全部子边列表，再用贪心最近邻重分配到各无人机路径。
     这是断点评估的核心辅助函数，用于 PSO 粒子评估和断点邻域搜索。
     返回完整 Solution（包含路径和断点）。
+
+    max_drones: 最多使用的无人机数量（None 表示使用全部 inst.num_drones 架）。
+               通过限制可用无人机数量，可以评估「少架无人机」方案是否更优
+               （节省 call_cost，代价是每架路径更长）。
     """
-    sol = Solution(inst.num_drones, inst.num_edges)
+    # 确定实际可用无人机数量
+    n_drones = inst.num_drones if max_drones is None else max(1, min(max_drones, inst.num_drones))
+
+    sol = Solution(inst.num_drones, inst.num_edges)  # Solution 始终保留 num_drones 槽位
     sol.breakpoints = list(breakpoints)
 
     depot_x, depot_y = inst.node_coord(inst.depot_idx)
@@ -461,11 +469,11 @@ def greedy_build_solution_from_breakpoints(
     # 未分配子边索引
     unassigned = list(range(len(all_sub_edges)))
 
-    # 每架无人机当前位置和已用能耗
-    curr_pos = [(depot_x, depot_y)] * inst.num_drones
-    curr_dist = [0.0] * inst.num_drones
+    # 只使用前 n_drones 架无人机
+    curr_pos = [(depot_x, depot_y)] * n_drones
+    curr_dist = [0.0] * n_drones
 
-    max_outer = len(all_sub_edges) * inst.num_drones * 2
+    max_outer = len(all_sub_edges) * n_drones * 2
     attempt = 0
 
     while unassigned and attempt < max_outer:
@@ -473,7 +481,7 @@ def greedy_build_solution_from_breakpoints(
         placed = False
 
         # 按已用能耗升序选无人机
-        drone_order = sorted(range(inst.num_drones), key=lambda d: curr_dist[d])
+        drone_order = sorted(range(n_drones), key=lambda d: curr_dist[d])
 
         for di in drone_order:
             cx, cy = curr_pos[di]
@@ -517,7 +525,7 @@ def greedy_build_solution_from_breakpoints(
 
         if not placed:
             # 强制分配给剩余最少的无人机（违约，但保证子边不丢失）
-            di = min(range(inst.num_drones), key=lambda d: curr_dist[d])
+            di = min(range(n_drones), key=lambda d: curr_dist[d])
             uid = unassigned[0]
             se = all_sub_edges[uid]
             direction, sx, sy = best_direction(se, curr_pos[di][0], curr_pos[di][1])
@@ -535,6 +543,92 @@ def greedy_build_solution_from_breakpoints(
     sol.invalidate_cache()
     sol = merge_redundant_breakpoints(sol, inst)
     return sol
+
+
+def best_k_drones_solution(
+    inst: Instance, breakpoints: List[Optional[float]],
+    active_drones: int = None
+) -> Solution:
+    """
+    自动选择最优无人机数量：对给定断点配置，枚举 k=1..active_drones，
+    对每个 k 调用 greedy_build_solution_from_breakpoints(max_drones=k)，
+    返回总费用（含 call_cost）最低的方案。
+
+    active_drones: 搜索上限（None 表示使用 inst.num_drones）。
+                   若已通过 greedy_estimate_min_drones 预估，传入预估值可避免重复枚举。
+    """
+    limit = inst.num_drones if active_drones is None else max(1, min(active_drones, inst.num_drones))
+    best_sol = None
+    best_cost = float('inf')
+    for k in range(1, limit + 1):
+        sol_k = greedy_build_solution_from_breakpoints(inst, breakpoints, max_drones=k)
+        cost_k = compute_cost(sol_k, inst)
+        if cost_k < best_cost:
+            best_cost = cost_k
+            best_sol = sol_k
+    return best_sol
+
+
+def greedy_estimate_min_drones(inst: Instance, verbose: bool = True) -> int:
+    """
+    贪心预估最少可行无人机数量（ALNS-PSO 正式搜索前调用）。
+
+    策略：
+    1. 尝试多种断点配置（无断点、全部0.5、若干随机），对每种配置：
+       - 从 k = inst.num_drones 开始向下搜索；
+       - 若 k 架无人机能构建出无强制违约的可行解（所有子边均在电池约束内分配），
+         则继续尝试 k-1；
+       - 若 k-1 出现强制违约（有子边无法在电池约束内放入任意路径），则回退到 k；
+       - 直到 k=1 或找不到可行解为止。
+    2. 取所有断点配置找到的最小可行 k 中，费用最低对应的 k 作为推荐值。
+
+    可行性判据：
+    - greedy_build_solution_from_breakpoints 中有"强制分配"逻辑（即违约放置）；
+    - 此处通过 is_feasible() 检查是否所有路径满足电池约束来判断是否真正可行。
+
+    返回：推荐使用的无人机架数 k_min（1 ≤ k_min ≤ inst.num_drones）
+    """
+    if verbose:
+        print(f"贪心预估最少可行无人机数量（上限 {inst.num_drones} 架）...")
+
+    # 生成若干断点配置用于测试
+    test_configs = []
+    # 无断点
+    test_configs.append([None] * inst.num_edges)
+    # 全部 0.5
+    test_configs.append([0.5] * inst.num_edges)
+    # 若干随机配置（覆盖不同稀疏度）
+    for frac in [0.25, 0.5, 0.75]:
+        bp = [0.5 if random.random() < frac else None for _ in range(inst.num_edges)]
+        test_configs.append(bp)
+
+    best_k = inst.num_drones   # 默认使用全部无人机
+    best_k_cost = float('inf')
+
+    for bps in test_configs:
+        # 从最大值向下搜索最小可行 k
+        prev_feasible_k = inst.num_drones
+        for k in range(inst.num_drones, 0, -1):
+            sol_k = greedy_build_solution_from_breakpoints(inst, bps, max_drones=k)
+            if is_feasible(sol_k, inst):
+                prev_feasible_k = k
+            else:
+                # k 不可行，回退到上一个可行的 k
+                break
+        # 计算该断点配置下最小可行 k 的费用
+        sol_best = greedy_build_solution_from_breakpoints(inst, bps, max_drones=prev_feasible_k)
+        cost_best = compute_cost(sol_best, inst)
+        if cost_best < best_k_cost:
+            best_k_cost = cost_best
+            best_k = prev_feasible_k
+
+    if verbose:
+        active_count = best_k
+        saved = inst.num_drones - active_count
+        print(f"  预估最优无人机数量: {active_count} 架"
+              f"（原配置 {inst.num_drones} 架，节省 {saved} 架 × call_cost={inst.call_cost:.1f}）")
+
+    return best_k
 
 
 def merge_redundant_breakpoints(sol: Solution, inst: Instance) -> Solution:
@@ -684,37 +778,42 @@ def best_direction(se: SubEdge, curr_x: float, curr_y: float) -> Tuple[bool, flo
         return False, se.bx, se.by
 
 
-def multi_start_initial_solution(inst: Instance, n_starts: int = 8) -> Solution:
+def multi_start_initial_solution(inst: Instance, n_starts: int = 8,
+                                  active_drones: int = None) -> Solution:
     """
     多启动初始解构建：
-    1. 生成无断点贪心解
-    2. 生成全断点（所有边设断点）贪心解
-    3. 生成多个随机断点比例（30%/50%/70%）的贪心解
-    4. 返回费用最低的解作为初始解
+    1. 无断点贪心解
+    2. 全断点（所有边 λ=0.5）贪心解 + 断点位置精化
+    3. 多个随机断点配置的贪心解 + 断点位置精化
+    返回费用最低的解作为初始解。
+
+    active_drones: 固定使用的无人机数量（由 greedy_estimate_min_drones 预估，None 则枚举选最优）。
     """
     candidates = []
 
     # --- 策略1: 无断点贪心解 ---
     bps_none = [None] * inst.num_edges
-    sol0 = greedy_build_solution_from_breakpoints(inst, bps_none)
+    sol0 = best_k_drones_solution(inst, bps_none, active_drones=active_drones)
     cost0 = compute_cost(sol0, inst)
     candidates.append((cost0, sol0))
 
-    # --- 策略2: 所有边设断点在0.5处 ---
+    # --- 策略2: 所有边设断点在0.5处 + 精化 ---
     bps_all = [0.5] * inst.num_edges
-    sol_all = greedy_build_solution_from_breakpoints(inst, bps_all)
+    sol_all = best_k_drones_solution(inst, bps_all, active_drones=active_drones)
+    sol_all = optimize_breakpoint_positions(sol_all, inst)
     cost_all = compute_cost(sol_all, inst)
     candidates.append((cost_all, sol_all))
 
-    # --- 策略3~N: 随机断点配置 ---
-    for _ in range(n_starts - 2):
+    # --- 策略3~N: 随机断点配置 + 精化 ---
+    for _ in range(max(0, n_starts - 2)):
         bps_rand = []
         for _ in range(inst.num_edges):
-            if random.random() < 0.5:
+            if random.random() < 0.4:
                 bps_rand.append(random.uniform(0.15, 0.85))
             else:
                 bps_rand.append(None)
-        sol_rand = greedy_build_solution_from_breakpoints(inst, bps_rand)
+        sol_rand = best_k_drones_solution(inst, bps_rand, active_drones=active_drones)
+        sol_rand = optimize_breakpoint_positions(sol_rand, inst)
         cost_rand = compute_cost(sol_rand, inst)
         candidates.append((cost_rand, sol_rand))
 
@@ -1175,6 +1274,392 @@ def destroy_breakpoint_split(sol: Solution, inst: Instance,
     return new_sol, removed
 
 
+
+
+def repair_breakpoint_aware_insert(
+    sol: Solution, inst: Instance, removed: List[SubEdge]
+) -> Solution:
+    """
+    断点感知修复算子：
+    对被移除的子边，优先评估同一条原始边两段分配给不同无人机的方案。
+    核心逻辑：
+    - 对有配对段（seg=1/seg=2 同属一条原始边）的子边，先独立找各自最佳插入位置，
+      再比较"配对分离插入"与"单独插入"的总费用增量，选最优方案；
+    - 配对评估只取每条路径末尾位置（O(num_drones²)），快速粗筛后再精细搜索；
+    - 普通子边（无配对或已处理）退化为标准贪心插入。
+    """
+    new_sol = sol.copy()
+    depot_x, depot_y = inst.node_coord(inst.depot_idx)
+    random.shuffle(removed)
+
+    # 建立"配对表"：同一原始边的两段互为配对
+    pair_map: dict = {}
+    for se in removed:
+        if se.seg in (1, 2):
+            target_seg = 2 if se.seg == 1 else 1
+            for other in removed:
+                if (other.origin_edge_idx == se.origin_edge_idx
+                        and other.seg == target_seg):
+                    pair_map[id(se)] = other
+                    break
+
+    inserted_ids: set = set()
+
+    def _insert_cost(route: DroneRoute, pos: int, direction: bool, sub_e: SubEdge) -> float:
+        n = len(route.sub_edges)
+        sx, sy = (sub_e.ax, sub_e.ay) if direction else (sub_e.bx, sub_e.by)
+        ex, ey = (sub_e.bx, sub_e.by) if direction else (sub_e.ax, sub_e.ay)
+        prev_x = depot_x if pos == 0 else route.end_point(pos - 1)[0]
+        prev_y = depot_y if pos == 0 else route.end_point(pos - 1)[1]
+        next_x = depot_x if pos == n else route.start_point(pos)[0]
+        next_y = depot_y if pos == n else route.start_point(pos)[1]
+        old_t = inst.euclidean(prev_x, prev_y, next_x, next_y)
+        new_t = (inst.euclidean(prev_x, prev_y, sx, sy)
+                 + sub_e.length
+                 + inst.euclidean(ex, ey, next_x, next_y))
+        return ((new_t - old_t) * inst.transfer_coef * inst.energy_cost
+                + sub_e.length * inst.inspect_coef * inst.energy_cost)
+
+    def _feasible(route: DroneRoute, pos: int, direction: bool, sub_e: SubEdge) -> bool:
+        temp = DroneRoute(
+            sub_edges=route.sub_edges[:pos] + [sub_e] + route.sub_edges[pos:],
+            directions=route.directions[:pos] + [direction] + route.directions[pos:]
+        )
+        return compute_route_distance(temp, inst) <= inst.battery
+
+    def _best_insert(sub_e: SubEdge):
+        """返回 (best_delta, di, pos, direction) 的最优贪心插入"""
+        best_delta = float('inf')
+        best_di, best_pos, best_dir = -1, -1, True
+        for di in range(inst.num_drones):
+            route = new_sol.routes[di]
+            n = len(route.sub_edges)
+            for pos in range(n + 1):
+                for direction in [True, False]:
+                    if not _feasible(route, pos, direction, sub_e):
+                        continue
+                    delta = _insert_cost(route, pos, direction, sub_e)
+                    if delta < best_delta:
+                        best_delta = delta
+                        best_di, best_pos, best_dir = di, pos, direction
+        return best_delta, best_di, best_pos, best_dir
+
+    for se in removed:
+        if id(se) in inserted_ids:
+            continue
+
+        partner = pair_map.get(id(se))
+
+        # 找 se 自身的最优贪心插入
+        delta_se, di_se, pos_se, dir_se = _best_insert(se)
+
+        if partner is not None and id(partner) not in inserted_ids:
+            # 找 partner 的最优贪心插入
+            delta_pt, di_pt, pos_pt, dir_pt = _best_insert(partner)
+
+            # "分离插入" = 两者独立贪心，总费用增量
+            combined_sep = delta_se + delta_pt
+
+            # 检查是否可以将两段都分给同一架无人机（合并方案）
+            # 找到同机插入两段时费用最低的无人机
+            best_merge_delta = float('inf')
+            best_merge_di = -1
+            for di_try in range(inst.num_drones):
+                route_try = new_sol.routes[di_try]
+                n_try = len(route_try.sub_edges)
+                # 尝试在末尾插入两段（粗略评估合并方案）
+                # se 在末尾，partner 紧跟在 se 后面
+                for d1 in [True, False]:
+                    if not _feasible(route_try, n_try, d1, se):
+                        continue
+                    delta1 = _insert_cost(route_try, n_try, d1, se)
+                    # 临时插入 se 来评估 partner
+                    temp_route = DroneRoute(
+                        sub_edges=route_try.sub_edges + [se],
+                        directions=route_try.directions + [d1]
+                    )
+                    for d2 in [True, False]:
+                        if not _feasible(temp_route, n_try + 1, d2, partner):
+                            continue
+                        delta2 = _insert_cost(temp_route, n_try + 1, d2, partner)
+                        # 合并插入只付一次 call_cost，因此可以省去一次调用费用
+                        merge_total = delta1 + delta2
+                        if merge_total < best_merge_delta:
+                            best_merge_delta = merge_total
+                            best_merge_di = di_try
+
+            # 若合并方案比分离方案更优（少一架无人机的 call_cost 带来的潜在收益），
+            # 且合并总费用增量更小，则用合并方案
+            use_merge = (best_merge_di >= 0 and best_merge_delta < combined_sep * 0.95)
+
+            if use_merge:
+                # 合并插入：两段都放在同一架无人机末尾，merge_redundant 会自动消除断点
+                route_m = new_sol.routes[best_merge_di]
+                for d_try in [True, False]:
+                    if _feasible(route_m, len(route_m.sub_edges), d_try, se):
+                        route_m.sub_edges.append(se)
+                        route_m.directions.append(d_try)
+                        break
+                else:
+                    route_m.sub_edges.append(se)
+                    route_m.directions.append(True)
+                inserted_ids.add(id(se))
+                for d_try in [True, False]:
+                    if _feasible(route_m, len(route_m.sub_edges), d_try, partner):
+                        route_m.sub_edges.append(partner)
+                        route_m.directions.append(d_try)
+                        break
+                else:
+                    route_m.sub_edges.append(partner)
+                    route_m.directions.append(True)
+                inserted_ids.add(id(partner))
+                continue
+
+            # 分离插入：执行：先插入 se，再插入 partner
+            if di_se >= 0:
+                new_sol.routes[di_se].sub_edges.insert(pos_se, se)
+                new_sol.routes[di_se].directions.insert(pos_se, dir_se)
+                inserted_ids.add(id(se))
+            else:
+                # 强制末尾插入
+                di_se = min(range(inst.num_drones),
+                            key=lambda d: curr_dist_approx(new_sol.routes[d], depot_x, depot_y, inst))
+                direction, _, _ = best_direction(se, depot_x, depot_y)
+                new_sol.routes[di_se].sub_edges.append(se)
+                new_sol.routes[di_se].directions.append(direction)
+                inserted_ids.add(id(se))
+
+            # 重新计算 partner 最优（因为 se 已插入可能改变路径）
+            delta_pt2, di_pt2, pos_pt2, dir_pt2 = _best_insert(partner)
+            if di_pt2 >= 0:
+                new_sol.routes[di_pt2].sub_edges.insert(pos_pt2, partner)
+                new_sol.routes[di_pt2].directions.insert(pos_pt2, dir_pt2)
+            else:
+                di_pt2 = min(range(inst.num_drones),
+                             key=lambda d: curr_dist_approx(new_sol.routes[d], depot_x, depot_y, inst))
+                direction, _, _ = best_direction(partner, depot_x, depot_y)
+                new_sol.routes[di_pt2].sub_edges.append(partner)
+                new_sol.routes[di_pt2].directions.append(direction)
+            inserted_ids.add(id(partner))
+        else:
+            # 无配对或配对已插入：标准贪心插入
+            if di_se >= 0:
+                new_sol.routes[di_se].sub_edges.insert(pos_se, se)
+                new_sol.routes[di_se].directions.insert(pos_se, dir_se)
+            else:
+                di_se = min(range(inst.num_drones),
+                            key=lambda d: curr_dist_approx(new_sol.routes[d], depot_x, depot_y, inst))
+                direction, _, _ = best_direction(se, depot_x, depot_y)
+                new_sol.routes[di_se].sub_edges.append(se)
+                new_sol.routes[di_se].directions.append(direction)
+            inserted_ids.add(id(se))
+
+    new_sol.invalidate_cache()
+    # 消除修复过程中可能产生的冗余断点（同机连续服务同一边的两段）
+    new_sol = merge_redundant_breakpoints(new_sol, inst)
+    return new_sol
+
+
+def curr_dist_approx(route: DroneRoute, depot_x: float, depot_y: float,
+                     inst: Instance) -> float:
+    """近似计算路径当前已用距离（用于回退选机）"""
+    if not route.sub_edges:
+        return 0.0
+    return compute_route_distance(route, inst)
+
+
+def optimize_breakpoint_positions(sol: Solution, inst: Instance) -> Solution:
+    """
+    断点位置精确求解：
+    对解中每条有断点的边，在路径拓扑（哪段归哪架无人机）固定的前提下：
+    - 若两段被同一架无人机连续服务（无需断点），直接删除断点（合并为整条边）；
+    - 否则使用三分搜索解析地求最优断点位置 lambda*，最小化与断点相关的转移费用。
+
+    推导（两段分属不同无人机时）：
+        f(λ) = d(prev1, P(λ)) + d(P(λ), next1)   (seg1 的进/出转移)
+             + d(prev2, P(λ)) + d(P(λ), next2)   (seg2 的进/出转移)
+    其中 P(λ) = u + λ*(v-u) 为断点坐标，三分搜索在 [0.05, 0.95] 上求最小值。
+    """
+    new_sol = sol.copy()
+    inst_edges = inst.edges
+    depot_x, depot_y = inst.node_coord(inst.depot_idx)
+
+    # 建立索引：(edge_idx, seg) -> (drone_idx, pos_in_route)
+    se_index: dict = {}
+    for di, route in enumerate(new_sol.routes):
+        for i, se in enumerate(route.sub_edges):
+            se_index[(se.origin_edge_idx, se.seg)] = (di, i)
+
+    any_change = False
+    for ei, lam in enumerate(new_sol.breakpoints):
+        if lam is None:
+            continue
+
+        u, v = inst_edges[ei]
+        ux, uy = inst.node_coord(u)
+        vx, vy = inst.node_coord(v)
+        edge_len = math.hypot(ux - vx, uy - vy)
+        if edge_len < 1e-9:
+            continue
+
+        loc_seg1 = se_index.get((ei, 1))
+        loc_seg2 = se_index.get((ei, 2))
+        if loc_seg1 is None or loc_seg2 is None:
+            continue
+
+        di1, pos1 = loc_seg1
+        di2, pos2 = loc_seg2
+
+        # ---- 情形一：同一架无人机连续服务两段 → 直接消去断点 ----
+        if di1 == di2:
+            route = new_sol.routes[di1]
+            dir1 = route.directions[pos1]
+            dir2 = route.directions[pos2]
+            # 判断是否连续且方向连贯（seg1终点 == seg2起点）
+            # 正向连续：pos1 seg1 dir=True(u→bp) 紧接 pos2 seg2 dir=True(bp→v)
+            # 反向连续：pos1 seg2 dir=False(v→bp) 紧接 pos2 seg1 dir=False(bp→u)
+            consecutive = (abs(pos1 - pos2) == 1)
+            if consecutive:
+                # seg1先，seg2后（正向穿越）
+                if (pos1 + 1 == pos2
+                        and route.sub_edges[pos1].seg == 1 and dir1 is True
+                        and route.sub_edges[pos2].seg == 2 and dir2 is True):
+                    whole = SubEdge(origin_edge_idx=ei, seg=0,
+                                    ax=ux, ay=uy, bx=vx, by=vy)
+                    route.sub_edges[pos1] = whole
+                    route.sub_edges.pop(pos2)
+                    route.directions.pop(pos2)
+                    new_sol.breakpoints[ei] = None
+                    # 更新索引（后面的元素位置改变）
+                    se_index = {}
+                    for d, r in enumerate(new_sol.routes):
+                        for k, s in enumerate(r.sub_edges):
+                            se_index[(s.origin_edge_idx, s.seg)] = (d, k)
+                    any_change = True
+                    continue
+                # seg2先，seg1后（反向穿越）
+                elif (pos2 + 1 == pos1
+                        and route.sub_edges[pos2].seg == 2 and dir2 is False
+                        and route.sub_edges[pos1].seg == 1 and dir1 is False):
+                    whole = SubEdge(origin_edge_idx=ei, seg=0,
+                                    ax=ux, ay=uy, bx=vx, by=vy)
+                    route.sub_edges[pos2] = whole
+                    route.sub_edges.pop(pos1)
+                    route.directions.pop(pos1)
+                    new_sol.breakpoints[ei] = None
+                    se_index = {}
+                    for d, r in enumerate(new_sol.routes):
+                        for k, s in enumerate(r.sub_edges):
+                            se_index[(s.origin_edge_idx, s.seg)] = (d, k)
+                    any_change = True
+                    continue
+            # 同机但不连续（中间夹有其他子边）：删除断点，并将路径中的两段 seg=1/2
+            # 合并/替换为 seg=0 整边（保留先出现的那段，删除后出现的那段）
+            # 取 pos1 和 pos2 中较小的位置保留，用 seg=0 整边替换，删除另一段
+            keep_pos = min(pos1, pos2)
+            del_pos = max(pos1, pos2)
+            dir_keep = route.directions[keep_pos]
+            # 如果保留位置是 seg=2（反向进入），则整边方向为 False(v→u)
+            # 如果保留位置是 seg=1（正向进入），则整边方向为 True(u→v)
+            seg_keep = route.sub_edges[keep_pos].seg
+            if seg_keep == 1:
+                whole_dir = route.directions[keep_pos]  # True: u→bp → 整边变 u→v
+            else:
+                whole_dir = route.directions[keep_pos]  # False: v→bp → 整边变 v→u
+            whole = SubEdge(origin_edge_idx=ei, seg=0,
+                            ax=ux, ay=uy, bx=vx, by=vy)
+            route.sub_edges[keep_pos] = whole
+            route.directions[keep_pos] = whole_dir
+            route.sub_edges.pop(del_pos)
+            route.directions.pop(del_pos)
+            new_sol.breakpoints[ei] = None
+            se_index = {}
+            for d, r in enumerate(new_sol.routes):
+                for k, s in enumerate(r.sub_edges):
+                    se_index[(s.origin_edge_idx, s.seg)] = (d, k)
+            any_change = True
+            continue
+
+        # ---- 情形二：两段分属不同无人机 → 三分搜索最优断点位置 ----
+        route1 = new_sol.routes[di1]
+        route2 = new_sol.routes[di2]
+
+        n1 = len(route1.sub_edges)
+        n2 = len(route2.sub_edges)
+
+        # seg1 的前驱终点和后继起点
+        prev1_x = depot_x if pos1 == 0 else route1.end_point(pos1 - 1)[0]
+        prev1_y = depot_y if pos1 == 0 else route1.end_point(pos1 - 1)[1]
+        next1_x = depot_x if pos1 == n1 - 1 else route1.start_point(pos1 + 1)[0]
+        next1_y = depot_y if pos1 == n1 - 1 else route1.start_point(pos1 + 1)[1]
+
+        # seg2 的前驱终点和后继起点
+        prev2_x = depot_x if pos2 == 0 else route2.end_point(pos2 - 1)[0]
+        prev2_y = depot_y if pos2 == 0 else route2.end_point(pos2 - 1)[1]
+        next2_x = depot_x if pos2 == n2 - 1 else route2.start_point(pos2 + 1)[0]
+        next2_y = depot_y if pos2 == n2 - 1 else route2.start_point(pos2 + 1)[1]
+
+        def f_lambda(lam_val: float) -> float:
+            px = ux + lam_val * (vx - ux)
+            py = uy + lam_val * (vy - uy)
+            return (inst.euclidean(prev1_x, prev1_y, px, py)
+                    + inst.euclidean(px, py, next1_x, next1_y)
+                    + inst.euclidean(prev2_x, prev2_y, px, py)
+                    + inst.euclidean(px, py, next2_x, next2_y))
+
+        lo, hi = 0.05, 0.95
+        for _ in range(50):
+            m1 = lo + (hi - lo) / 3.0
+            m2 = hi - (hi - lo) / 3.0
+            if f_lambda(m1) < f_lambda(m2):
+                hi = m2
+            else:
+                lo = m1
+        best_lam = (lo + hi) / 2.0
+
+        if abs(best_lam - lam) > 1e-9:
+            new_sol.breakpoints[ei] = best_lam
+            any_change = True
+
+    if any_change:
+        new_sol = _rebuild_with_optimized_breakpoints(new_sol, inst)
+        new_sol.invalidate_cache()
+
+    return new_sol
+
+
+def _rebuild_with_optimized_breakpoints(sol: Solution, inst: Instance) -> Solution:
+    """
+    在断点位置更新后，重建所有子边的坐标（路径顺序/分配不变）。
+    """
+    new_sol = sol.copy()
+    for di, route in enumerate(new_sol.routes):
+        for idx, se in enumerate(route.sub_edges):
+            ei = se.origin_edge_idx
+            lam = new_sol.breakpoints[ei]
+            u, v = inst.edges[ei]
+            ux, uy = inst.node_coord(u)
+            vx, vy = inst.node_coord(v)
+            if lam is None:
+                new_se = SubEdge(origin_edge_idx=ei, seg=0,
+                                 ax=ux, ay=uy, bx=vx, by=vy)
+            else:
+                bpx = ux + lam * (vx - ux)
+                bpy = uy + lam * (vy - uy)
+                if se.seg == 1:
+                    new_se = SubEdge(origin_edge_idx=ei, seg=1,
+                                     ax=ux, ay=uy, bx=bpx, by=bpy)
+                elif se.seg == 2:
+                    new_se = SubEdge(origin_edge_idx=ei, seg=2,
+                                     ax=bpx, ay=bpy, bx=vx, by=vy)
+                else:
+                    new_se = SubEdge(origin_edge_idx=ei, seg=0,
+                                     ax=ux, ay=uy, bx=vx, by=vy)
+            new_sol.routes[di].sub_edges[idx] = new_se
+    new_sol.invalidate_cache()
+    return new_sol
+
+
 # ============================================================
 # 7. PSO 优化断点位置
 # ============================================================
@@ -1227,11 +1712,13 @@ class PSOBreakpointOptimizer:
         return pos
 
     def optimize_with_reassign(
-        self, inst: Instance, init_bps: List[Optional[float]]
+        self, inst: Instance, init_bps: List[Optional[float]],
+        active_drones: int = None
     ) -> Tuple[List[Optional[float]], float]:
         """
         以完整路径重分配为评估函数，PSO 自由优化断点配置。
         init_bps: 初始断点配置（用于初始化粒子）
+        active_drones: 固定使用的无人机架数（None 表示使用 inst.num_drones）
         返回 (最优断点配置, 最优费用)
         """
         # ---- 初始化粒子 ----
@@ -1252,7 +1739,10 @@ class PSOBreakpointOptimizer:
         # ---- 评估初始适应度 ----
         def evaluate(pos: np.ndarray) -> float:
             bps = self._decode_breakpoints(pos)
-            trial_sol = greedy_build_solution_from_breakpoints(inst, bps)
+            trial_sol = greedy_build_solution_from_breakpoints(
+                inst, bps, max_drones=active_drones)
+            # 精化断点位置：消除冗余断点 + 三分搜索最优位置，使评估更准确
+            trial_sol = optimize_breakpoint_positions(trial_sol, inst)
             return compute_cost(trial_sol, inst)
 
         pbest_pos = particles.copy()
@@ -1315,8 +1805,12 @@ class ALNSPSOSolver:
                  pso_freq: int = 50,    # 每隔多少ALNS迭代运行一次PSO
                  pso_particles: int = 15,
                  pso_iter: int = 20,
+                 # 无人机数量预估结果（由 greedy_estimate_min_drones 提供）
+                 active_drones: int = None,   # None 表示使用 inst.num_drones
                  ):
         self.inst = inst
+        # 固定全程使用的无人机数量（由贪心预估确定，不再动态枚举）
+        self.active_drones = inst.num_drones if active_drones is None else max(1, min(active_drones, inst.num_drones))
         self.max_iter = max_iter
         self.segment_size = segment_size
         self.removal_min = removal_min
@@ -1335,7 +1829,7 @@ class ALNSPSOSolver:
             destroy_random_removal,
             destroy_worst_removal,
             destroy_route_removal,
-            destroy_breakpoint_split,   # 断点感知破坏算子
+            destroy_breakpoint_split,      # 断点感知破坏算子
         ]
         self.destroy_names = ["random", "worst", "route", "bp_split"]
         self.destroy_weights = [1.0] * len(self.destroy_ops)
@@ -1346,8 +1840,9 @@ class ALNSPSOSolver:
         self.repair_ops = [
             repair_greedy_insert,
             repair_random_insert,
+            repair_breakpoint_aware_insert,  # 断点感知修复算子（两段分离/合并评估）
         ]
-        self.repair_names = ["greedy", "random"]
+        self.repair_names = ["greedy", "random", "bp_aware"]
         self.repair_weights = [1.0] * len(self.repair_ops)
         self.repair_scores = [0.0] * len(self.repair_ops)
         self.repair_counts = [0] * len(self.repair_ops)
@@ -1421,10 +1916,12 @@ class ALNSPSOSolver:
         inst = self.inst
         current_cost = compute_cost(sol, inst)
 
-        new_bps, new_cost = self.pso.optimize_with_reassign(inst, sol.breakpoints)
+        new_bps, new_cost = self.pso.optimize_with_reassign(
+            inst, sol.breakpoints, active_drones=self.active_drones)
 
         if new_cost < current_cost:
-            new_sol = greedy_build_solution_from_breakpoints(inst, new_bps)
+            new_sol = greedy_build_solution_from_breakpoints(
+                inst, new_bps, max_drones=self.active_drones)
             new_sol.invalidate_cache()
             return new_sol
         else:
@@ -1468,7 +1965,8 @@ class ALNSPSOSolver:
                 for lam in candidates_for_add:
                     trial_bps = list(current_bps)
                     trial_bps[ei] = lam
-                    trial_sol = greedy_build_solution_from_breakpoints(inst, trial_bps)
+                    trial_sol = greedy_build_solution_from_breakpoints(
+                        inst, trial_bps, max_drones=self.active_drones)
                     trial_cost = compute_cost(trial_sol, inst)
                     if trial_cost < best_cost:
                         best_cost = trial_cost
@@ -1478,7 +1976,8 @@ class ALNSPSOSolver:
                 # 当前有断点 → 尝试删除断点
                 trial_bps = list(current_bps)
                 trial_bps[ei] = None
-                trial_sol = greedy_build_solution_from_breakpoints(inst, trial_bps)
+                trial_sol = greedy_build_solution_from_breakpoints(
+                    inst, trial_bps, max_drones=self.active_drones)
                 trial_cost = compute_cost(trial_sol, inst)
                 if trial_cost < best_cost:
                     best_cost = trial_cost
@@ -1491,7 +1990,8 @@ class ALNSPSOSolver:
                                 random.uniform(0.55, 0.9)]:
                         trial_bps2 = list(current_bps)
                         trial_bps2[ei] = lam
-                        trial_sol2 = greedy_build_solution_from_breakpoints(inst, trial_bps2)
+                        trial_sol2 = greedy_build_solution_from_breakpoints(
+                            inst, trial_bps2, max_drones=self.active_drones)
                         trial_cost2 = compute_cost(trial_sol2, inst)
                         if trial_cost2 < best_cost:
                             best_cost = trial_cost2
@@ -1507,12 +2007,20 @@ class ALNSPSOSolver:
                 trial_bps = list(best_bps)
                 trial_bps[ei] = (0.5 if trial_bps[ei] is None else None)
                 trial_bps[ej] = (0.5 if trial_bps[ej] is None else None)
-                trial_sol = greedy_build_solution_from_breakpoints(inst, trial_bps)
+                trial_sol = greedy_build_solution_from_breakpoints(
+                    inst, trial_bps, max_drones=self.active_drones)
                 trial_cost = compute_cost(trial_sol, inst)
                 if trial_cost < best_cost:
                     best_cost = trial_cost
                     best_sol = trial_sol
                     best_bps = trial_bps
+
+        # 完整模式结束后做断点精化（消除同机冗余断点 + 精确位置）
+        if not fast_mode:
+            refined = optimize_breakpoint_positions(best_sol, inst)
+            refined_cost = compute_cost(refined, inst)
+            if refined_cost < best_cost:
+                best_sol = refined
 
         return best_sol
 
@@ -1533,8 +2041,9 @@ class ALNSPSOSolver:
         # 生成初始解
         if initial_sol is None:
             if verbose:
-                print("多启动策略生成初始解（尝试多种断点配置）...")
-            current_sol = multi_start_initial_solution(inst, n_starts=10)
+                print(f"多启动策略生成初始解（使用 {self.active_drones} 架无人机）...")
+            current_sol = multi_start_initial_solution(
+                inst, n_starts=10, active_drones=self.active_drones)
         else:
             current_sol = initial_sol.copy()
 
@@ -1575,19 +2084,20 @@ class ALNSPSOSolver:
 
             # 执行修复
             new_sol = self.repair_ops[ri_op](destroyed_sol, inst, removed)
+            # 消除修复后可能残留的冗余断点（同机连续服务同一边的两段）
+            new_sol = merge_redundant_breakpoints(new_sol, inst)
 
-            # 每隔 pso_freq 次迭代，对新解运行PSO优化断点
+            # 每隔 pso_freq 次迭代，对新解运行PSO优化断点，之后精化断点位置
             if (iteration + 1) % self.pso_freq == 0:
                 new_sol = self._run_pso_on_solution(new_sol)
+                new_sol = optimize_breakpoint_positions(new_sol, inst)
 
             # 断点邻域搜索：
-            # - 每 pso_freq/2 次做完整模式（枚举所有边+两边联合翻转）
-            # - 其余迭代做快速模式（随机选少量边，降低计算量）
-            bp_full_freq = max(1, self.pso_freq // 2)
-            if (iteration + 1) % bp_full_freq == 0:
+            # - 每 pso_freq 次做完整模式（枚举所有边+两边联合翻转），PSO后跟着做
+            # - 其余迭代不做断点搜索（保持速度）
+            if (iteration + 1) % self.pso_freq == 0:
                 new_sol = self._try_add_remove_breakpoints(new_sol, fast_mode=False)
-            else:
-                new_sol = self._try_add_remove_breakpoints(new_sol, fast_mode=True)
+                new_sol = optimize_breakpoint_positions(new_sol, inst)
 
             new_cost = compute_cost(new_sol, inst)
 
@@ -1629,22 +2139,25 @@ class ALNSPSOSolver:
         # 最终对最优解做多轮断点精化
         if verbose:
             print("最终 断点邻域搜索 + PSO 精化断点...")
-        # 第一轮：断点邻域搜索
+        # 第一轮：断点邻域搜索 + 精确断点位置
         final_sol = self._try_add_remove_breakpoints(best_sol)
+        final_sol = optimize_breakpoint_positions(final_sol, inst)
         final_cost = compute_cost(final_sol, inst)
         if final_cost < best_cost:
             best_sol = final_sol
             best_cost = final_cost
 
-        # 第二轮：PSO精化
+        # 第二轮：PSO精化 + 精确断点位置
         final_sol2 = self._run_pso_on_solution(best_sol)
+        final_sol2 = optimize_breakpoint_positions(final_sol2, inst)
         final_cost2 = compute_cost(final_sol2, inst)
         if final_cost2 < best_cost:
             best_sol = final_sol2
             best_cost = final_cost2
 
-        # 第三轮：再一次断点邻域搜索
+        # 第三轮：再一次断点邻域搜索 + 精确断点位置
         final_sol3 = self._try_add_remove_breakpoints(best_sol)
+        final_sol3 = optimize_breakpoint_positions(final_sol3, inst)
         final_cost3 = compute_cost(final_sol3, inst)
         if final_cost3 < best_cost:
             best_sol = final_sol3
@@ -1675,7 +2188,8 @@ class ALNSPSOSolver:
 
         # ---- 初始解 ----
         if initial_sol is None:
-            current_sol = multi_start_initial_solution(inst, n_starts=10)
+            current_sol = multi_start_initial_solution(
+                inst, n_starts=10, active_drones=self.active_drones)
         else:
             current_sol = initial_sol.copy()
         current_sol = self._try_add_remove_breakpoints(current_sol)
@@ -1701,17 +2215,15 @@ class ALNSPSOSolver:
                 current_sol, inst, removal_fraction
             )
             new_sol = self.repair_ops[ri_op](destroyed_sol, inst, removed)
+            # 消除修复后可能残留的冗余断点
+            new_sol = merge_redundant_breakpoints(new_sol, inst)
 
-            # PSO 优化断点
+            # PSO 优化断点 + 断点邻域搜索（仅每 pso_freq 次迭代）
             if (iteration + 1) % self.pso_freq == 0:
                 new_sol = self._run_pso_on_solution(new_sol)
-
-            # 断点邻域搜索
-            bp_full_freq = max(1, self.pso_freq // 2)
-            if (iteration + 1) % bp_full_freq == 0:
+                new_sol = optimize_breakpoint_positions(new_sol, inst)
                 new_sol = self._try_add_remove_breakpoints(new_sol, fast_mode=False)
-            else:
-                new_sol = self._try_add_remove_breakpoints(new_sol, fast_mode=True)
+                new_sol = optimize_breakpoint_positions(new_sol, inst)
 
             new_cost = compute_cost(new_sol, inst)
 
@@ -1752,14 +2264,18 @@ class ALNSPSOSolver:
                 if verbose:
                     print(f"  [T{thread_id}] Iter {iteration+1:4d} push cost={best_cost:.4f}")
 
-            # ---- 拉取：停滞超过 stagnation_limit 次时从公共池拉取全局最优 ----
+            # ---- 拉取：停滞超过 stagnation_limit 次时从公共池拉取多样化解 ----
             if stagnation_count >= stagnation_limit:
-                global_sol, global_cost = pool.pull_best()
-                if global_sol is not None and global_cost < current_cost:
-                    # 以公共池最优解的断点配置重新构建路径作为新起点
+                current_sig = _bp_signature(current_sol)
+                # 优先拉取结构最不同的解（真正多样化重启）
+                pull_sol, pull_cost = pool.pull_diverse(current_sig)
+                if pull_sol is not None:
+                    # 以拉取解的断点配置重新构建路径，再做断点精化
                     restarted = greedy_build_solution_from_breakpoints(
-                        inst, list(global_sol.breakpoints)
+                        inst, list(pull_sol.breakpoints),
+                        max_drones=self.active_drones
                     )
+                    restarted = optimize_breakpoint_positions(restarted, inst)
                     restarted_cost = compute_cost(restarted, inst)
                     current_sol = restarted.copy()
                     current_cost = restarted_cost
@@ -1767,20 +2283,23 @@ class ALNSPSOSolver:
                         best_sol = restarted.copy()
                         best_cost = restarted_cost
                     if verbose:
-                        print(f"  [T{thread_id}] Iter {iteration+1:4d} pull "
-                              f"global={global_cost:.4f} → restart={restarted_cost:.4f}")
+                        print(f"  [T{thread_id}] Iter {iteration+1:4d} pull_diverse "
+                              f"pull={pull_cost:.4f} → restart={restarted_cost:.4f}")
                 stagnation_count = 0
 
-        # ---- 最终精化 ----
+        # ---- 最终精化（含断点位置精确求解）----
         final_sol = self._try_add_remove_breakpoints(best_sol)
+        final_sol = optimize_breakpoint_positions(final_sol, inst)
         if compute_cost(final_sol, inst) < best_cost:
             best_sol = final_sol
             best_cost = compute_cost(final_sol, inst)
         final_sol2 = self._run_pso_on_solution(best_sol)
+        final_sol2 = optimize_breakpoint_positions(final_sol2, inst)
         if compute_cost(final_sol2, inst) < best_cost:
             best_sol = final_sol2
             best_cost = compute_cost(final_sol2, inst)
         final_sol3 = self._try_add_remove_breakpoints(best_sol)
+        final_sol3 = optimize_breakpoint_positions(final_sol3, inst)
         if compute_cost(final_sol3, inst) < best_cost:
             best_sol = final_sol3
             best_cost = compute_cost(final_sol3, inst)
@@ -1800,25 +2319,73 @@ class ALNSPSOSolver:
 import threading
 
 
+def _bp_signature(sol: Solution) -> frozenset:
+    """
+    计算解的断点拓扑签名：哪些边有断点（不考虑断点具体位置）。
+    用于衡量两个解的结构相似度。
+    """
+    return frozenset(ei for ei, lam in enumerate(sol.breakpoints) if lam is not None)
+
+
+def _bp_jaccard_similarity(sig_a: frozenset, sig_b: frozenset) -> float:
+    """两个断点签名的 Jaccard 相似度（0=完全不同，1=完全相同）"""
+    if not sig_a and not sig_b:
+        return 1.0
+    union = sig_a | sig_b
+    inter = sig_a & sig_b
+    return len(inter) / len(union)
+
+
 class SharedPool:
     """
-    线程安全的公共解池。
-    维护一个固定容量的精英解列表（按费用升序），供各线程异步推送/拉取。
+    线程安全的公共解池（含断点结构多样性保留）。
+    维护一个固定容量的精英解列表，推送时同时考虑费用和断点结构多样性：
+    - 若新解与池中某解断点拓扑高度相似（Jaccard >= diversity_threshold），
+      则只在新解费用更好时才替换该相似解，不额外占用容量；
+    - 否则作为新的多样化解加入，淘汰最差的重复解。
+    这样精英池能保留费用不同、断点结构也不同的多种解，
+    供停滞线程拉取时获得真正不同的搜索起点。
     """
-    def __init__(self, capacity: int = 5):
+    def __init__(self, capacity: int = 5, diversity_threshold: float = 0.8):
         self._lock = threading.Lock()
         self._pool: List[Tuple[float, Solution]] = []   # (cost, sol)
         self.capacity = capacity
+        self.diversity_threshold = diversity_threshold
         self.total_pushes = 0
         self.total_pulls = 0
 
     def push(self, sol: Solution, cost: float, thread_id: int = -1):
-        """将一个解推入公共池；若超出容量则淘汰最差解。"""
+        """
+        将一个解推入公共池，保持多样性：
+        1. 检查池中是否有断点结构高度相似的解（Jaccard >= threshold）；
+        2. 若有且新解更好，替换之；若有且新解更差，丢弃；
+        3. 若无相似解，直接加入，然后淘汰费用最差解（保持容量上限）。
+        """
         with self._lock:
-            self._pool.append((cost, sol.copy()))
-            self._pool.sort(key=lambda x: x[0])
-            if len(self._pool) > self.capacity:
-                self._pool = self._pool[:self.capacity]
+            new_sig = _bp_signature(sol)
+            sol_copy = sol.copy()
+
+            # 找池中与新解结构最相似的解
+            best_sim = 0.0
+            best_sim_idx = -1
+            for idx, (c, s) in enumerate(self._pool):
+                sim = _bp_jaccard_similarity(new_sig, _bp_signature(s))
+                if sim > best_sim:
+                    best_sim = sim
+                    best_sim_idx = idx
+
+            if best_sim >= self.diversity_threshold and best_sim_idx >= 0:
+                # 相似解：只在新解更好时替换
+                if cost < self._pool[best_sim_idx][0]:
+                    self._pool[best_sim_idx] = (cost, sol_copy)
+                    self._pool.sort(key=lambda x: x[0])
+            else:
+                # 无相似解：直接加入
+                self._pool.append((cost, sol_copy))
+                self._pool.sort(key=lambda x: x[0])
+                if len(self._pool) > self.capacity:
+                    self._pool = self._pool[:self.capacity]
+
             self.total_pushes += 1
 
     def pull_best(self) -> Tuple[Optional[Solution], float]:
@@ -1829,6 +2396,30 @@ class SharedPool:
                 cost, sol = self._pool[0]
                 return sol.copy(), cost
             return None, float('inf')
+
+    def pull_diverse(self, current_sig: frozenset) -> Tuple[Optional[Solution], float]:
+        """
+        拉取与当前解结构差异最大的精英解（用于停滞后的多样化重启）。
+        若所有解都相似，则回退为拉取全局最优。
+        """
+        with self._lock:
+            self.total_pulls += 1
+            if not self._pool:
+                return None, float('inf')
+            # 找与 current_sig 最不相似的解
+            best_div = -1.0
+            best_idx = 0
+            for idx, (c, s) in enumerate(self._pool):
+                sim = _bp_jaccard_similarity(current_sig, _bp_signature(s))
+                div = 1.0 - sim
+                if div > best_div:
+                    best_div = div
+                    best_idx = idx
+            # 若多样性改进不明显，回退到全局最优（idx=0）
+            if best_div < 0.2:
+                best_idx = 0
+            cost, sol = self._pool[best_idx]
+            return sol.copy(), cost
 
     def global_best(self) -> Tuple[Optional[Solution], float]:
         """获取全局最优解（不计入 pull 统计）。"""
@@ -1842,9 +2433,11 @@ class SharedPool:
         with self._lock:
             n = len(self._pool)
             best = self._pool[0][0] if self._pool else float('inf')
+            sigs = [_bp_signature(s) for _, s in self._pool]
+            n_unique = len(set(sigs))
         return (f"SharedPool: size={n}/{self.capacity}, "
-                f"best={best:.4f}, pushes={self.total_pushes}, "
-                f"pulls={self.total_pulls}")
+                f"best={best:.4f}, unique_structures={n_unique}, "
+                f"pushes={self.total_pushes}, pulls={self.total_pulls}")
 
 
 def parallel_solve(
@@ -1857,6 +2450,7 @@ def parallel_solve(
     pso_freq: int = 50,
     pso_particles: int = 15,
     pso_iter: int = 20,
+    active_drones: int = None,  # 预估得到的最少可行无人机数量
     verbose: bool = True,
 ) -> Tuple[Solution, List[float]]:
     """
@@ -1896,6 +2490,7 @@ def parallel_solve(
             pso_freq=pso_freq,
             pso_particles=pso_particles,
             pso_iter=pso_iter,
+            active_drones=active_drones,
         )
         sol, hist = solver.solve_parallel_worker(
             pool=pool,
@@ -2407,6 +3002,9 @@ def solve_instance(instance_path: str,
 
     t_start = time.time()
 
+    # ---- 贪心预估最少可行无人机数量（ALNS-PSO 正式搜索之前）----
+    active_drones = greedy_estimate_min_drones(inst, verbose=verbose)
+
     if num_threads > 1:
         # 异步并行模式
         best_sol, cost_history = parallel_solve(
@@ -2418,6 +3016,7 @@ def solve_instance(instance_path: str,
             pso_freq=pso_freq,
             pso_particles=pso_particles,
             pso_iter=pso_iter,
+            active_drones=active_drones,
             verbose=verbose,
         )
     else:
@@ -2428,6 +3027,7 @@ def solve_instance(instance_path: str,
             pso_freq=pso_freq,
             pso_particles=pso_particles,
             pso_iter=pso_iter,
+            active_drones=active_drones,
         )
         best_sol, cost_history = solver.solve(verbose=verbose)
 
