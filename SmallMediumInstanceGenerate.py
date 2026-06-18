@@ -8,7 +8,7 @@ import numpy as np
 # ============================================================
 # 无人机参数（定死）
 # ============================================================
-DRONE_BATTERY    = 30000        # 无人机电池容量 30,000m
+DRONE_BATTERY    = 15000        # 无人机电池容量 30,000m
 DRONE_SPEED      = 15           # 无人机速度 m/s
 DRONE_ENERGY_COST = 1.5         # 无人机能源成本系数 元/kwh
 DRONE_CALL_COST  = 10           # 无人机一次调用成本 元/次
@@ -65,16 +65,28 @@ def can_add_edge(G, pos, u, v):
     return True
 
 
-def generate_strict_road_network(mode, target_nodes, target_edges):
-    """生成平面路网，返回图 G 和坐标字典 pos（原始坐标，不归一化）"""
+def generate_strict_road_network(mode, target_nodes, target_edges, grid_size=None):
+    """
+    生成平面路网，返回图 G 和坐标字典 pos（原始坐标，不归一化）。
+    grid_size: 仅在 mode=='grid' 时有效，指定背景网格边长（如 5 表示 5×5 格点）。
+              若为 None，则自动按 target_nodes 推断（≤10 用 5×5，否则用 10×10）。
+    """
     G = nx.Graph()
     pos = {}
 
     # --- 1. 节点生成阶段 ---
     if mode == "grid":
-        side = int(np.ceil(np.sqrt(target_nodes)))
-        for i in range(target_nodes):
-            pos[i] = np.array([float(i % side), float(i // side)])
+        # 确定背景网格尺寸
+        if grid_size is None:
+            grid_size = 5 if target_nodes <= 10 else 10
+        # 生成全部格点候选坐标
+        all_grid_points = [(float(col), float(row))
+                           for row in range(grid_size)
+                           for col in range(grid_size)]
+        # 随机抽取 target_nodes 个格点作为路网节点
+        chosen = random.sample(all_grid_points, min(target_nodes, len(all_grid_points)))
+        for i, (cx, cy) in enumerate(chosen):
+            pos[i] = np.array([cx, cy])
     elif mode == "radial":
         pos[0] = np.array([0.0, 0.0])
         num_arms = 8
@@ -106,21 +118,25 @@ def generate_strict_road_network(mode, target_nodes, target_edges):
     for i in range(target_nodes): G.add_node(i)
 
     # --- 2. 基础骨架连接 ---
+    # grid 模式：阈值取 √2+0.05，覆盖水平/垂直邻格（距离1）和对角邻格（距离√2≈1.41）
+    # 其他模式保持原有阈值 1.1
+    base_thresh = (np.sqrt(2) + 0.05) if mode == "grid" else 1.1
     nodes_list = list(G.nodes())
-    for i in range(target_nodes):
-        for j in range(i + 1, target_nodes):
+    actual_nodes = len(nodes_list)
+    for i in range(actual_nodes):
+        for j in range(i + 1, actual_nodes):
             dist = np.linalg.norm(pos[i] - pos[j])
-            if dist <= 1.1:
+            if dist <= base_thresh:
                 if can_add_edge(G, pos, i, j):
                     G.add_edge(i, j)
 
     # --- 3. 动态补边 ---
+    # 不限制距离，仅以无交叉（平面图）为约束，随机尝试直到满足目标边数
     attempts = 0
-    while G.number_of_edges() < target_edges and attempts < 2000:
+    while G.number_of_edges() < target_edges and attempts < 5000:
         u, v = random.sample(nodes_list, 2)
-        if np.linalg.norm(pos[u] - pos[v]) < 4.0:
-            if can_add_edge(G, pos, u, v):
-                G.add_edge(u, v)
+        if can_add_edge(G, pos, u, v):
+            G.add_edge(u, v)
         attempts += 1
 
     return G, pos
@@ -154,10 +170,12 @@ def compute_depot_pos(pos, direction):
         return np.array([cx, cy])
 
 
-def save_network_figure(fig_path, G, pos, all_depot_positions):
+def save_network_figure(fig_path, G, pos, all_depot_positions, grid_size=None):
     """
     将路网与所有基站位置绘制成一张图并保存为 PNG。
     all_depot_positions: [(depot_id, direction_label, depot_pos), ...]
+    grid_size: 若不为 None，则在图上绘制背景格点（未被选中的格点用灰色小点表示）。
+               注意 pos 此时已乘以 COORD_MULTIPLIER，格点坐标需同步缩放。
     """
     # 构建 1-indexed 节点标签
     labels = {i: str(i + 1) for i in G.nodes()}
@@ -165,6 +183,16 @@ def save_network_figure(fig_path, G, pos, all_depot_positions):
     pos_tuple = {k: (v[0], v[1]) for k, v in pos.items()}
 
     fig, ax = plt.subplots(figsize=(7, 7))
+
+    # 绘制背景格点（未被选中的格点）
+    if grid_size is not None:
+        used_coords = set((v[0], v[1]) for v in pos.values())
+        for row in range(grid_size):
+            for col in range(grid_size):
+                gx = float(col) * COORD_MULTIPLIER
+                gy = float(row) * COORD_MULTIPLIER
+                if (gx, gy) not in used_coords:
+                    ax.scatter(gx, gy, marker='.', s=30, c='#CCCCCC', zorder=1, linewidths=0)
 
     # 画路网
     nx.draw_networkx_edges(G, pos_tuple, ax=ax, edge_color='#444444', width=1.5)
@@ -261,21 +289,56 @@ SAVE_PNG = True    # 是否生成 .png 可视化图
 COORD_MULTIPLIER = 250
 
 # 无人机数量固定
-NUM_DRONES = 2
+NUM_DRONES = 5
 
 # 每组 (路网节点数, 目标边数)
-# 小规模算例：5-10 个节点
-SMALL_CONFIGS = [
-    (4,  5),
-    (5,  7),
-    (6,  8),
-    (9,  13),
-]
+# 小规模算例：节点数 4~10，每种节点数对应若干边数规格
+# 格式: (road_nodes, target_edges)
+# 节点4: 4边
+# 节点5: 4边、6边
+# 节点6: 5边、7边
+# 节点7: 6边、9边
+# 节点8: 7边、10边
+# 节点9: 8边、12边
+# 节点10: 9边、14边
+# SMALL_CONFIGS = [
+#     (4,  4),
+#     (5,  4),
+#     (5,  6),
+#     (6,  5),
+#     (6,  7),
+#     (7,  6),
+#     (7,  9),
+#     (8,  7),
+#     (8,  10),
+#     (9,  8),
+#     (9,  12),
+#     (10, 9),
+#     (10, 14),
+# ]
 
-# 中等规模算例：10-20 个节点
+# 中等规模算例：节点数 12~20，每种节点数对应若干边数规格
+# 节点12: 12边、14边、16边
+# 节点14: 14边、16边、18边
+# 节点16: 16边、19边、22边
+# 节点18: 18边、21边、24边
+# 节点20: 20边、24边、28边
 MEDIUM_CONFIGS = [
-    (15, 22),
-    (19, 28),
+    (12, 12),
+    (12, 14),
+    (12, 16),
+    (14, 14),
+    (14, 16),
+    (14, 18),
+    (16, 16),
+    (16, 19),
+    (16, 22),
+    (18, 18),
+    (18, 21),
+    (18, 24),
+    (20, 20),
+    (20, 24),
+    (20, 28),
 ]
 
 MODES = ["grid"]   # 使用 grid 模式
@@ -289,8 +352,8 @@ DEPOT_DIRECTIONS = [
     (5, 'center'),
 ]
 
-# 每组配置生成的随机实例数
-NUM_INSTANCES_PER_CONFIG = 1
+# 每组配置生成的随机实例数（每种节点数-边数组合生成3个不同随机实例）
+NUM_INSTANCES_PER_CONFIG = 3
 
 # 输出目录（按规模分别存放，当前均为随机算例）
 OUTPUT_DIR_SMALL  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "算例", "随机算例", "0-Small")
@@ -301,16 +364,20 @@ os.makedirs(OUTPUT_DIR_MEDIUM, exist_ok=True)
 # ============================================================
 # 主生成逻辑
 # ============================================================
-def generate_for_configs(configs, output_dir, label):
-    """对给定配置列表批量生成算例并保存到指定目录"""
+def generate_for_configs(configs, output_dir, label, grid_size=None):
+    """
+    对给定配置列表批量生成算例并保存到指定目录。
+    grid_size: 背景网格边长（grid 模式专用）。小规模传 5，中等规模传 10。
+    """
     total_saved = 0
     total_figs  = 0
     os.makedirs(output_dir, exist_ok=True)
     for mode in MODES:
         for (road_nodes, edges) in configs:
             for inst_idx in range(NUM_INSTANCES_PER_CONFIG):
-                print(f"\n[{label}] 生成路网: mode={mode}, nodes={road_nodes}, edges={edges}, 实例#{inst_idx}")
-                G, pos = generate_strict_road_network(mode, road_nodes, edges)
+                print(f"\n[{label}] 生成路网: mode={mode}, nodes={road_nodes}, edges={edges}, "
+                      f"grid={grid_size}x{grid_size}, 实例#{inst_idx}")
+                G, pos = generate_strict_road_network(mode, road_nodes, edges, grid_size=grid_size)
                 actual_edges = G.number_of_edges()
                 if actual_edges == 0:
                     print(f"  警告：路网边数为0，跳过。")
@@ -336,15 +403,18 @@ def generate_for_configs(configs, output_dir, label):
                 if SAVE_PNG:
                     fig_name = f"{total_nodes}-{actual_edges}-{NUM_DRONES}-({inst_idx}).png"
                     fig_path = os.path.join(output_dir, fig_name)
-                    save_network_figure(fig_path, G, scaled_pos, all_depot_positions)
+                    save_network_figure(fig_path, G, scaled_pos, all_depot_positions,
+                                        grid_size=grid_size)
                     total_figs += 1
     return total_saved, total_figs
 
 
 if __name__ == "__main__":
-    s1, f1 = generate_for_configs(SMALL_CONFIGS,  OUTPUT_DIR_SMALL,  "小规模")
-    s2, f2 = generate_for_configs(MEDIUM_CONFIGS, OUTPUT_DIR_MEDIUM, "中等规模")
+    # 小规模：从 5×5 背景网格中随机抽点
+    # s1, f1 = generate_for_configs(SMALL_CONFIGS,  OUTPUT_DIR_SMALL,  "小规模",   grid_size=5)
+    # 中等规模：从 10×10 背景网格中随机抽点
+    s2, f2 = generate_for_configs(MEDIUM_CONFIGS, OUTPUT_DIR_MEDIUM, "中等规模", grid_size=10)
 
     print(f"\n全部完成：")
-    print(f"  0-Small  → {OUTPUT_DIR_SMALL}  ({s1} 个文件, {f1} 张图)")
+    # print(f"  0-Small  → {OUTPUT_DIR_SMALL}  ({s1} 个文件, {f1} 张图)")
     print(f"  1-Medium → {OUTPUT_DIR_MEDIUM} ({s2} 个文件, {f2} 张图)")

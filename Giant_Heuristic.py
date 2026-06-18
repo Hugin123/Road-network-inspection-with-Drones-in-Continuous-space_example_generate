@@ -1258,17 +1258,220 @@ def try_add_remove_breakpoints(
     return best_gs
 
 
+def _ternary_search_lambda_gs(
+    ux: float, uy: float, vx: float, vy: float,
+    prev1_x: float, prev1_y: float, next1_x: float, next1_y: float,
+    prev2_x: float, prev2_y: float, next2_x: float, next2_y: float,
+    lo: float = 0.05, hi: float = 0.95, steps: int = 50
+) -> Tuple[float, float]:
+    """
+    对断点 P(λ) = u + λ*(v-u) 做三分搜索，最小化
+        f(λ) = d(prev1, P) + d(P, next1) + d(prev2, P) + d(P, next2)
+    返回 (best_lambda, f_value)。
+    """
+    for _ in range(steps):
+        m1 = lo + (hi - lo) / 3.0
+        m2 = hi - (hi - lo) / 3.0
+
+        def _f(lam: float) -> float:
+            px = ux + lam * (vx - ux)
+            py = uy + lam * (vy - uy)
+            return (math.hypot(prev1_x - px, prev1_y - py)
+                    + math.hypot(px - next1_x, py - next1_y)
+                    + math.hypot(prev2_x - px, prev2_y - py)
+                    + math.hypot(px - next2_x, py - next2_y))
+
+        if _f(m1) < _f(m2):
+            hi = m2
+        else:
+            lo = m1
+    best_lam = (lo + hi) / 2.0
+    px = ux + best_lam * (vx - ux)
+    py = uy + best_lam * (vy - uy)
+    val = (math.hypot(prev1_x - px, prev1_y - py)
+           + math.hypot(px - next1_x, py - next1_y)
+           + math.hypot(prev2_x - px, prev2_y - py)
+           + math.hypot(px - next2_x, py - next2_y))
+    return best_lam, val
+
+
+def try_add_remove_breakpoints_cooperative(
+    gs: GiantRouteSolution, inst: Instance
+) -> GiantRouteSolution:
+    """
+    断点-路径协同搜索（思路三 for Giant Route，修正版）：
+    对每条无断点的边，枚举多个候选 λ，直接用全局 evaluate_gs 评估是否改进。
+
+    原实现的问题：用近似增量 delta_approx 过滤候选断点时，假设打断点后两段都是
+    "从depot出发的独立新路径"，严重高估了打断点的费用（实际 Split DP 会把断开的子边
+    拼接到已有路径中），导致大量有潜力的断点被错误过滤。
+
+    修正：去掉 delta_approx 过滤，改为对每条边的多个候选 λ（包括三分搜索推荐值和
+    等分候选）直接做全局 evaluate_gs 评估，精确判断是否有改进。
+
+    对有断点的边，同样用全局评估检验删除后是否更优。
+    """
+    best_gs = gs.copy()
+    best_cost = evaluate_gs(best_gs, inst)
+
+    n = len(best_gs.giant_route)
+    if n < 2:
+        return best_gs
+
+    depot_x, depot_y = inst.node_coord(inst.depot_idx)
+
+    # ----------------------------------------------------------------
+    # 阶段1：对每条无断点的边，尝试多个候选 λ（全局评估，无近似过滤）
+    # ----------------------------------------------------------------
+    for ei in range(inst.num_edges):
+        if best_gs.breakpoints[ei] is not None:
+            continue
+
+        # 找到该边在 giant_route 中的位置
+        se_idx = None
+        for gi, se in enumerate(best_gs.giant_route):
+            if se.origin_edge_idx == ei and se.seg == 0:
+                se_idx = gi
+                break
+        if se_idx is None:
+            continue
+
+        u, v = inst.edges[ei]
+        ux, uy = inst.node_coord(u)
+        vx, vy = inst.node_coord(v)
+        edge_len = math.hypot(ux - vx, uy - vy)
+        if edge_len < 1e-9:
+            continue
+
+        # 生成候选 λ 集合：等分候选 + 三分搜索推荐
+        candidate_lambdas = set()
+        for lam_c in [0.25, 0.5, 0.75]:
+            candidate_lambdas.add(lam_c)
+
+        # 获取前驱/后继端点用于三分搜索
+        if se_idx > 0:
+            prev_se = best_gs.giant_route[se_idx - 1]
+            prev_cx = (prev_se.ax + prev_se.bx) / 2.0
+            prev_cy = (prev_se.ay + prev_se.by) / 2.0
+        else:
+            prev_cx, prev_cy = depot_x, depot_y
+
+        if se_idx < len(best_gs.giant_route) - 1:
+            next_se = best_gs.giant_route[se_idx + 1]
+            next_cx = (next_se.ax + next_se.bx) / 2.0
+            next_cy = (next_se.ay + next_se.by) / 2.0
+        else:
+            next_cx, next_cy = depot_x, depot_y
+
+        # 三分搜索推荐 λ（两种 seg 分配方案）
+        lam1, _ = _ternary_search_lambda_gs(
+            ux, uy, vx, vy,
+            prev_cx, prev_cy, depot_x, depot_y,
+            depot_x, depot_y, next_cx, next_cy
+        )
+        lam2, _ = _ternary_search_lambda_gs(
+            ux, uy, vx, vy,
+            depot_x, depot_y, next_cx, next_cy,
+            prev_cx, prev_cy, depot_x, depot_y
+        )
+        candidate_lambdas.add(round(max(0.05, min(0.95, lam1)), 4))
+        candidate_lambdas.add(round(max(0.05, min(0.95, lam2)), 4))
+
+        u_node, v_node = inst.edges[ei]
+        ux2, uy2 = inst.node_coord(u_node)
+        vx2, vy2 = inst.node_coord(v_node)
+
+        # 对每个候选 λ 构建 trial Giant Route 并做全局评估
+        for lam_c in candidate_lambdas:
+            bpx = ux2 + lam_c * (vx2 - ux2)
+            bpy = uy2 + lam_c * (vy2 - uy2)
+            seg1_se = SubEdge(origin_edge_idx=ei, seg=1,
+                              ax=ux2, ay=uy2, bx=bpx, by=bpy)
+            seg2_se = SubEdge(origin_edge_idx=ei, seg=2,
+                              ax=bpx, ay=bpy, bx=vx2, by=vy2)
+            new_route = (best_gs.giant_route[:se_idx]
+                         + [seg1_se, seg2_se]
+                         + best_gs.giant_route[se_idx + 1:])
+            trial_bps = list(best_gs.breakpoints)
+            trial_bps[ei] = lam_c
+            trial_gs = GiantRouteSolution(best_gs.num_edges)
+            trial_gs.breakpoints = trial_bps
+            trial_gs.giant_route = new_route
+            try:
+                trial_cost = evaluate_gs(trial_gs, inst)
+                if trial_cost < best_cost - 1e-9:
+                    best_cost = trial_cost
+                    best_gs = trial_gs.copy()
+                    best_gs._cost = trial_cost
+                    # se_idx 不变（断点插入后 giant_route 长度变化，
+                    # 但本次循环只处理一条边，直接退出候选λ循环即可）
+                    break
+            except Exception:
+                pass
+
+    # ----------------------------------------------------------------
+    # 阶段2：对每条有断点的边，检验删除是否更优（全局评估）
+    # ----------------------------------------------------------------
+    for ei in range(inst.num_edges):
+        if best_gs.breakpoints[ei] is None:
+            continue
+
+        idx1, idx2 = None, None
+        for gi, se in enumerate(best_gs.giant_route):
+            if se.origin_edge_idx == ei:
+                if se.seg == 1:
+                    idx1 = gi
+                elif se.seg == 2:
+                    idx2 = gi
+        if idx1 is None or idx2 is None:
+            continue
+
+        u_node, v_node = inst.edges[ei]
+        ux2, uy2 = inst.node_coord(u_node)
+        vx2, vy2 = inst.node_coord(v_node)
+        se_whole = SubEdge(origin_edge_idx=ei, seg=0,
+                           ax=ux2, ay=uy2, bx=vx2, by=vy2)
+        keep_idx = min(idx1, idx2)
+        del_idx = max(idx1, idx2)
+        trial_bps = list(best_gs.breakpoints)
+        trial_bps[ei] = None
+        new_route = list(best_gs.giant_route)
+        new_route[keep_idx] = se_whole
+        new_route.pop(del_idx)
+        trial_gs = GiantRouteSolution(best_gs.num_edges)
+        trial_gs.breakpoints = trial_bps
+        trial_gs.giant_route = new_route
+        try:
+            trial_cost = evaluate_gs(trial_gs, inst)
+            if trial_cost < best_cost - 1e-9:
+                best_cost = trial_cost
+                best_gs = trial_gs.copy()
+                best_gs._cost = trial_cost
+        except Exception:
+            pass
+
+    return best_gs
+
+
 # ============================================================
 # 12. PSO 优化断点位置
 # ============================================================
 
 class PSOBreakpointOptimizer:
     """
-    粒子群优化器：在固定 Giant Route 顺序和断点存在性的前提下，
-    只优化各有断点的边的断点位置 λ。
+    断点二层优化器（Giant Route 版，修复了混合编码跳变缺陷）。
 
-    决策变量：对每条有断点的边，λ_i ∈ [0.05, 0.95]
-    评估函数：重建子边坐标 → 调用 Split DP → 计算总费用
+    原问题：Giant Route PSO 将断点位置 λ ∈ [0.05, 0.95] 用连续粒子搜索，
+    但断点存在性固定，当某条边由无断点变为有断点时需要修改 Giant Route 顺序，
+    原 PSO 无法探索"是否打断点"的二值决策空间。
+
+    新设计（二层分离）：
+      外层：二值遗传搜索，优化每条边是否有断点（0/1 掩码）；
+            每次改变断点存在性后，相应修改 Giant Route 中的子边序列（插入/合并）；
+      内层：对给定断点集合，重建 GiantRouteSolution 并用 Split DP 评估费用；
+            断点位置初始用 0.5，由全局评估自动优化（重建后三分搜索或直接使用中点）。
+
+    与 ALNS_PSO 中的 PSOBreakpointOptimizer 对齐，遵循相同的二层架构。
     """
     def __init__(self, num_particles: int = 20, max_iter: int = 30,
                  w: float = 0.7, c1: float = 1.5, c2: float = 1.5):
@@ -1278,75 +1481,146 @@ class PSOBreakpointOptimizer:
         self.c1 = c1
         self.c2 = c2
 
+    def _build_gs_from_mask(
+        self, gs: GiantRouteSolution, inst: Instance, bp_mask: np.ndarray
+    ) -> GiantRouteSolution:
+        """
+        根据断点存在性掩码（0/1 数组）重建 GiantRouteSolution。
+        对当前有断点但掩码为0的边：合并回整边；
+        对当前无断点但掩码为1的边：在中点插入断点；
+        其余保持不变。
+        """
+        new_gs = gs.copy()
+        for ei in range(inst.num_edges):
+            curr_has_bp = (new_gs.breakpoints[ei] is not None)
+            want_bp = (bp_mask[ei] > 0.5)
+
+            if curr_has_bp and not want_bp:
+                # 合并：找到 seg1/seg2 在 giant_route 中的位置，替换为整边
+                idx1, idx2 = None, None
+                for gi, se in enumerate(new_gs.giant_route):
+                    if se.origin_edge_idx == ei:
+                        if se.seg == 1:
+                            idx1 = gi
+                        elif se.seg == 2:
+                            idx2 = gi
+                if idx1 is not None and idx2 is not None:
+                    u_node, v_node = inst.edges[ei]
+                    ux2, uy2 = inst.node_coord(u_node)
+                    vx2, vy2 = inst.node_coord(v_node)
+                    se_whole = SubEdge(origin_edge_idx=ei, seg=0,
+                                      ax=ux2, ay=uy2, bx=vx2, by=vy2)
+                    keep_idx = min(idx1, idx2)
+                    del_idx = max(idx1, idx2)
+                    new_gs.giant_route[keep_idx] = se_whole
+                    new_gs.giant_route.pop(del_idx)
+                    new_gs.breakpoints[ei] = None
+
+            elif not curr_has_bp and want_bp:
+                # 分裂：找到 seg=0 的位置，替换为 seg1+seg2（λ=0.5）
+                se_idx = None
+                for gi, se in enumerate(new_gs.giant_route):
+                    if se.origin_edge_idx == ei and se.seg == 0:
+                        se_idx = gi
+                        break
+                if se_idx is not None:
+                    u_node, v_node = inst.edges[ei]
+                    ux2, uy2 = inst.node_coord(u_node)
+                    vx2, vy2 = inst.node_coord(v_node)
+                    lam = 0.5
+                    bpx2 = ux2 + lam * (vx2 - ux2)
+                    bpy2 = uy2 + lam * (vy2 - uy2)
+                    seg1_se = SubEdge(origin_edge_idx=ei, seg=1,
+                                     ax=ux2, ay=uy2, bx=bpx2, by=bpy2)
+                    seg2_se = SubEdge(origin_edge_idx=ei, seg=2,
+                                     ax=bpx2, ay=bpy2, bx=vx2, by=vy2)
+                    new_gs.giant_route = (new_gs.giant_route[:se_idx]
+                                          + [seg1_se, seg2_se]
+                                          + new_gs.giant_route[se_idx + 1:])
+                    new_gs.breakpoints[ei] = lam
+
+        new_gs._cost = None
+        return new_gs
+
     def optimize(
         self, gs: GiantRouteSolution, inst: Instance
     ) -> GiantRouteSolution:
         """
-        对当前 GiantRouteSolution 中有断点的边优化断点位置。
+        外层遗传搜索 + 内层 Split DP 评估，联合优化断点存在性。
         返回优化后的 GiantRouteSolution（若改进则更新，否则返回原解）。
         """
-        # 收集有断点的边索引
-        bp_edges = [ei for ei, lam in enumerate(gs.breakpoints) if lam is not None]
-        if not bp_edges:
-            return gs
-
-        dim = len(bp_edges)
+        E = inst.num_edges
         current_cost = evaluate_gs(gs, inst)
 
-        # 初始化粒子
-        init_pos = np.array([gs.breakpoints[ei] for ei in bp_edges])
-        particles = np.tile(init_pos, (self.num_particles, 1))
-        noise = np.random.uniform(-0.2, 0.2, (self.num_particles, dim))
-        particles = np.clip(particles + noise, 0.05, 0.95)
-        particles[0] = init_pos.copy()
-        # 部分粒子随机初始化
+        # ---- 初始化种群（二值掩码）----
+        init_mask = np.array([1.0 if bp is not None else 0.0
+                               for bp in gs.breakpoints])
+        population = np.tile(init_mask, (self.num_particles, 1))
+
+        # 其余粒子随机翻转少量位
+        for i in range(1, self.num_particles):
+            n_flip = max(1, random.randint(1, max(1, E // 4)))
+            flip_idx = random.sample(range(E), min(n_flip, E))
+            population[i] = init_mask.copy()
+            for fi in flip_idx:
+                population[i][fi] = 1.0 - population[i][fi]
+
+        # 最后 1/5 粒子完全随机
         n_rand = max(2, self.num_particles // 5)
-        particles[-n_rand:] = np.random.uniform(0.05, 0.95, (n_rand, dim))
+        for i in range(self.num_particles - n_rand, self.num_particles):
+            population[i] = (np.random.rand(E) < 0.3).astype(float)
 
-        velocities = np.random.uniform(-0.15, 0.15, (self.num_particles, dim))
+        # ---- 评估初始适应度 ----
+        pbest_mask = population.copy()
+        pbest_cost = np.full(self.num_particles, float('inf'))
+        pbest_gs_list: List[Optional[GiantRouteSolution]] = [None] * self.num_particles
 
-        def evaluate(pos: np.ndarray) -> float:
-            new_bps = list(gs.breakpoints)
-            for i, ei in enumerate(bp_edges):
-                new_bps[ei] = float(np.clip(pos[i], 0.05, 0.95))
-            trial_gs = rebuild_sub_edges_in_giant_route(gs, inst, new_bps)
+        for i in range(self.num_particles):
+            trial_gs_i = self._build_gs_from_mask(gs, inst, population[i])
             try:
-                return evaluate_gs(trial_gs, inst)
+                cost_i = evaluate_gs(trial_gs_i, inst)
             except Exception:
-                return float('inf')
+                cost_i = float('inf')
+            pbest_cost[i] = cost_i
+            pbest_gs_list[i] = trial_gs_i
 
-        pbest_pos = particles.copy()
-        pbest_cost = np.array([evaluate(p) for p in particles])
         gbest_idx = int(np.argmin(pbest_cost))
-        gbest_pos = pbest_pos[gbest_idx].copy()
+        gbest_mask = pbest_mask[gbest_idx].copy()
         gbest_cost = float(pbest_cost[gbest_idx])
+        gbest_gs = pbest_gs_list[gbest_idx]
 
-        w = self.w
+        # ---- 外层遗传主循环 ----
         for _ in range(self.max_iter):
             for i in range(self.num_particles):
-                r1 = np.random.rand(dim)
-                r2 = np.random.rand(dim)
-                velocities[i] = (w * velocities[i]
-                                 + self.c1 * r1 * (pbest_pos[i] - particles[i])
-                                 + self.c2 * r2 * (gbest_pos - particles[i]))
-                velocities[i] = np.clip(velocities[i], -0.3, 0.3)
-                particles[i] = np.clip(particles[i] + velocities[i], 0.05, 0.95)
-                cost = evaluate(particles[i])
-                if cost < pbest_cost[i]:
-                    pbest_cost[i] = cost
-                    pbest_pos[i] = particles[i].copy()
-                    if cost < gbest_cost:
-                        gbest_cost = cost
-                        gbest_pos = particles[i].copy()
-            w = max(0.35, w * 0.97)
+                new_mask = pbest_mask[i].copy()
+                n_flip = random.randint(1, max(1, min(3, E)))
+                flip_idx = random.sample(range(E), n_flip)
+                for fi in flip_idx:
+                    new_mask[fi] = 1.0 - new_mask[fi]
 
-        if gbest_cost < current_cost - 1e-9:
-            new_bps = list(gs.breakpoints)
-            for i, ei in enumerate(bp_edges):
-                new_bps[ei] = float(np.clip(gbest_pos[i], 0.05, 0.95))
-            result_gs = rebuild_sub_edges_in_giant_route(gs, inst, new_bps)
-            result_gs._cost = gbest_cost
-            return result_gs
+                # 杂交：以 30% 概率借用全局最优的一个位
+                if random.random() < 0.3 and E > 0:
+                    borrow_idx = random.randint(0, E - 1)
+                    new_mask[borrow_idx] = gbest_mask[borrow_idx]
+
+                trial_gs_i = self._build_gs_from_mask(gs, inst, new_mask)
+                try:
+                    cost_i = evaluate_gs(trial_gs_i, inst)
+                except Exception:
+                    cost_i = float('inf')
+
+                if cost_i < pbest_cost[i]:
+                    pbest_cost[i] = cost_i
+                    pbest_mask[i] = new_mask.copy()
+                    pbest_gs_list[i] = trial_gs_i
+                    if cost_i < gbest_cost:
+                        gbest_cost = cost_i
+                        gbest_mask = new_mask.copy()
+                        gbest_gs = trial_gs_i
+
+        if gbest_cost < current_cost - 1e-9 and gbest_gs is not None:
+            gbest_gs._cost = gbest_cost
+            return gbest_gs
         return gs
 
 
@@ -1422,6 +1696,20 @@ class GiantRouteALNSSolver:
 
         self.cost_history = []
         self.best_cost_history = []
+
+        # ---- 进程统计（每个 solver 实例对应一个进程/线程）----
+        self.stats_destroy_calls  = [0] * len(self.destroy_ops)
+        self.stats_destroy_time   = [0.0] * len(self.destroy_ops)
+        self.stats_destroy_impr_cur  = [0] * len(self.destroy_ops)
+        self.stats_destroy_impr_best = [0] * len(self.destroy_ops)
+        self.stats_repair_calls   = [0] * len(self.repair_ops)
+        self.stats_repair_time    = [0.0] * len(self.repair_ops)
+        self.stats_repair_impr_cur   = [0] * len(self.repair_ops)
+        self.stats_repair_impr_best  = [0] * len(self.repair_ops)
+        # 模块耗时
+        self.stats_time_dr     = 0.0   # 破坏+修复总耗时
+        self.stats_time_ls     = 0.0   # 局部搜索(or-opt / 断点邻域)总耗时
+        self.stats_time_pso    = 0.0   # PSO 总耗时
 
     def _roulette_select(self, weights: List[float]) -> int:
         total = sum(weights)
@@ -1508,25 +1796,41 @@ class GiantRouteALNSSolver:
         for iteration in range(self.max_iter):
             removal_fraction = random.uniform(self.removal_min, self.removal_max)
 
-            # 破坏
+            # 破坏 + 修复（统计耗时）
             di_op = self._roulette_select(self.destroy_weights)
             ri_op = self._roulette_select(self.repair_weights)
+            _t0 = time.time()
             destroyed_gs, removed = self.destroy_ops[di_op](
                 current_gs, inst, removal_fraction)
-
-            # 修复
+            _t_destroy = time.time()
             new_gs = self.repair_ops[ri_op](destroyed_gs, inst, removed)
+            _t_repair = time.time()
+            _t_dr_end = _t_repair
 
-            # 局部搜索（or-opt，每 ls_freq 次）
+            self.stats_destroy_calls[di_op] += 1
+            self.stats_destroy_time[di_op]  += _t_destroy - _t0
+            self.stats_repair_calls[ri_op]  += 1
+            self.stats_repair_time[ri_op]   += _t_repair - _t_destroy
+            self.stats_time_dr += _t_dr_end - _t0
+
+            # 局部搜索（or-opt，每 ls_freq 次）+ 断点邻域 / PSO（每 pso_freq 次）
             if (iteration + 1) % self.ls_freq == 0:
+                _t_ls0 = time.time()
                 new_gs = local_search_or_opt(new_gs, inst,
                                              segment_sizes=[1, 2],
                                              max_no_improve=3)
+                self.stats_time_ls += time.time() - _t_ls0
 
-            # PSO 优化断点位置（每 pso_freq 次）
             if (iteration + 1) % self.pso_freq == 0:
+                _t_pso0 = time.time()
                 new_gs = self.pso.optimize(new_gs, inst)
+                self.stats_time_pso += time.time() - _t_pso0
+
+                _t_ls1 = time.time()
+                # 断点-路径协同搜索（思路三）
+                new_gs = try_add_remove_breakpoints_cooperative(new_gs, inst)
                 new_gs = try_add_remove_breakpoints(new_gs, inst, fast_mode=False)
+                self.stats_time_ls += time.time() - _t_ls1
 
             try:
                 new_cost = evaluate_gs(new_gs, inst)
@@ -1537,22 +1841,34 @@ class GiantRouteALNSSolver:
                 self.best_cost_history.append(best_cost)
                 continue
 
-            # 接受准则
+            # 接受准则，并统计改进次数
             score = 0.0
+            _impr_best = False
+            _impr_cur  = False
             if new_cost < best_cost - 1e-9:
                 best_gs = new_gs.copy()
                 best_cost = new_cost
                 current_gs = new_gs.copy()
                 current_cost = new_cost
                 score = self.sigma1
+                _impr_best = True
+                _impr_cur  = True
             elif new_cost < current_cost - 1e-9:
                 current_gs = new_gs.copy()
                 current_cost = new_cost
                 score = self.sigma2
+                _impr_cur = True
             elif self._sa_accept(current_cost, new_cost):
                 current_gs = new_gs.copy()
                 current_cost = new_cost
                 score = self.sigma3
+
+            if _impr_best:
+                self.stats_destroy_impr_best[di_op] += 1
+                self.stats_repair_impr_best[ri_op]  += 1
+            if _impr_cur:
+                self.stats_destroy_impr_cur[di_op] += 1
+                self.stats_repair_impr_cur[ri_op]  += 1
 
             self._update_weights(di_op, ri_op, score)
             self.sa_temp *= self.sa_cooling
@@ -1604,13 +1920,23 @@ class GiantRouteALNSSolver:
         except Exception:
             pass
 
-        # 第四轮：再一次断点邻域搜索
-        final_gs4 = try_add_remove_breakpoints(best_gs, inst, fast_mode=False)
+        # 第四轮：断点协同搜索（思路三）
+        final_gs4 = try_add_remove_breakpoints_cooperative(best_gs, inst)
         try:
             final_cost4 = evaluate_gs(final_gs4, inst)
             if final_cost4 < best_cost - 1e-9:
                 best_gs = final_gs4.copy()
                 best_cost = final_cost4
+        except Exception:
+            pass
+
+        # 第五轮：协同搜索结果再做一次传统邻域搜索
+        final_gs5 = try_add_remove_breakpoints(best_gs, inst, fast_mode=False)
+        try:
+            final_cost5 = evaluate_gs(final_gs5, inst)
+            if final_cost5 < best_cost - 1e-9:
+                best_gs = final_gs5.copy()
+                best_cost = final_cost5
         except Exception:
             pass
 
@@ -1660,18 +1986,36 @@ class GiantRouteALNSSolver:
 
             di_op = self._roulette_select(self.destroy_weights)
             ri_op = self._roulette_select(self.repair_weights)
+            _t0 = time.time()
             destroyed_gs, removed = self.destroy_ops[di_op](
                 current_gs, inst, removal_fraction)
+            _t_destroy = time.time()
             new_gs = self.repair_ops[ri_op](destroyed_gs, inst, removed)
+            _t_repair = time.time()
+
+            self.stats_destroy_calls[di_op] += 1
+            self.stats_destroy_time[di_op]  += _t_destroy - _t0
+            self.stats_repair_calls[ri_op]  += 1
+            self.stats_repair_time[ri_op]   += _t_repair - _t_destroy
+            self.stats_time_dr += _t_repair - _t0
 
             if (iteration + 1) % self.ls_freq == 0:
+                _t_ls0 = time.time()
                 new_gs = local_search_or_opt(new_gs, inst,
                                              segment_sizes=[1, 2],
                                              max_no_improve=3)
+                self.stats_time_ls += time.time() - _t_ls0
 
             if (iteration + 1) % self.pso_freq == 0:
+                _t_pso0 = time.time()
                 new_gs = self.pso.optimize(new_gs, inst)
+                self.stats_time_pso += time.time() - _t_pso0
+
+                _t_ls1 = time.time()
+                # 断点-路径协同搜索（思路三）
+                new_gs = try_add_remove_breakpoints_cooperative(new_gs, inst)
                 new_gs = try_add_remove_breakpoints(new_gs, inst, fast_mode=False)
+                self.stats_time_ls += time.time() - _t_ls1
 
             try:
                 new_cost = evaluate_gs(new_gs, inst)
@@ -1682,6 +2026,8 @@ class GiantRouteALNSSolver:
                 continue
 
             score = 0.0
+            _impr_best = False
+            _impr_cur  = False
             if new_cost < best_cost - 1e-9:
                 best_gs = new_gs.copy()
                 best_cost = new_cost
@@ -1689,11 +2035,14 @@ class GiantRouteALNSSolver:
                 current_cost = new_cost
                 score = self.sigma1
                 stagnation_count = 0
+                _impr_best = True
+                _impr_cur  = True
             elif new_cost < current_cost - 1e-9:
                 current_gs = new_gs.copy()
                 current_cost = new_cost
                 score = self.sigma2
                 stagnation_count += 1
+                _impr_cur = True
             elif self._sa_accept(current_cost, new_cost):
                 current_gs = new_gs.copy()
                 current_cost = new_cost
@@ -1701,6 +2050,13 @@ class GiantRouteALNSSolver:
                 stagnation_count += 1
             else:
                 stagnation_count += 1
+
+            if _impr_best:
+                self.stats_destroy_impr_best[di_op] += 1
+                self.stats_repair_impr_best[ri_op]  += 1
+            if _impr_cur:
+                self.stats_destroy_impr_cur[di_op] += 1
+                self.stats_repair_impr_cur[ri_op]  += 1
 
             self._update_weights(di_op, ri_op, score)
             self.sa_temp *= self.sa_cooling
@@ -1751,7 +2107,7 @@ class GiantRouteALNSSolver:
         except Exception:
             pass
 
-        final_gs2 = try_add_remove_breakpoints(best_gs, inst, fast_mode=False)
+        final_gs2 = try_add_remove_breakpoints_cooperative(best_gs, inst)
         try:
             fc2 = evaluate_gs(final_gs2, inst)
             if fc2 < best_cost - 1e-9:
@@ -1760,12 +2116,21 @@ class GiantRouteALNSSolver:
         except Exception:
             pass
 
-        final_gs3 = self.pso.optimize(best_gs, inst)
+        final_gs3 = try_add_remove_breakpoints(best_gs, inst, fast_mode=False)
         try:
             fc3 = evaluate_gs(final_gs3, inst)
             if fc3 < best_cost - 1e-9:
                 best_gs = final_gs3.copy()
                 best_cost = fc3
+        except Exception:
+            pass
+
+        final_gs4 = self.pso.optimize(best_gs, inst)
+        try:
+            fc4 = evaluate_gs(final_gs4, inst)
+            if fc4 < best_cost - 1e-9:
+                best_gs = final_gs4.copy()
+                best_cost = fc4
         except Exception:
             pass
 
@@ -1887,8 +2252,8 @@ def parallel_solve(
     pso_iter: int = 30,
     ls_freq: int = 25,
     verbose: bool = True,
-) -> Tuple[Solution, List[float]]:
-    """异步并行 Giant Route ALNS+PSO 求解"""
+) -> Tuple[Solution, List[float], List[dict]]:
+    """异步并行 Giant Route ALNS+PSO 求解，返回 (best_sol, merged_hist, per_thread_stats)"""
     pool = SharedPool(capacity=pool_capacity)
 
     if verbose:
@@ -1899,6 +2264,7 @@ def parallel_solve(
 
     threads = []
     thread_results: List[Optional[Tuple[Solution, List[float]]]] = [None] * num_threads
+    thread_solvers: List[Optional['GiantRouteALNSSolver']] = [None] * num_threads
 
     def worker(tid: int):
         solver = GiantRouteALNSSolver(
@@ -1909,6 +2275,7 @@ def parallel_solve(
             pso_iter=pso_iter,
             ls_freq=ls_freq,
         )
+        thread_solvers[tid] = solver
         sol, hist = solver.solve_parallel_worker(
             pool=pool, thread_id=tid,
             push_freq=push_freq,
@@ -1951,10 +2318,33 @@ def parallel_solve(
     else:
         merged_hist = []
 
+    # 收集每个线程的统计信息
+    per_thread_stats = []
+    for tid in range(num_threads):
+        s = thread_solvers[tid]
+        if s is None:
+            per_thread_stats.append(None)
+            continue
+        per_thread_stats.append({
+            'destroy_names':      s.destroy_names,
+            'repair_names':       s.repair_names,
+            'destroy_calls':      s.stats_destroy_calls,
+            'destroy_time':       s.stats_destroy_time,
+            'destroy_impr_cur':   s.stats_destroy_impr_cur,
+            'destroy_impr_best':  s.stats_destroy_impr_best,
+            'repair_calls':       s.stats_repair_calls,
+            'repair_time':        s.stats_repair_time,
+            'repair_impr_cur':    s.stats_repair_impr_cur,
+            'repair_impr_best':   s.stats_repair_impr_best,
+            'time_dr':            s.stats_time_dr,
+            'time_ls':            s.stats_time_ls,
+            'time_pso':           s.stats_time_pso,
+        })
+
     if verbose:
         print(f"并行求解完成！全局最优费用: {best_cost:.4f}")
 
-    return best_sol, merged_hist
+    return best_sol, merged_hist, per_thread_stats
 
 
 # ============================================================
@@ -2147,8 +2537,61 @@ def plot_solution(sol: Solution, inst: Instance, output_path: str,
     print(f"路径可视化图已保存: {output_path}")
 
 
+def _format_stats_table(per_thread_stats: List[dict]) -> str:
+    """将每个进程的算子统计格式化为文本表格，返回字符串"""
+    if not per_thread_stats:
+        return ""
+    lines = []
+    lines.append("=" * 80)
+    lines.append("算子统计报告（按进程/线程区分）")
+    lines.append("=" * 80)
+
+    for tid, st in enumerate(per_thread_stats):
+        if st is None:
+            continue
+        lines.append(f"\n── 进程 {tid + 1} ──")
+
+        # 模块总耗时
+        lines.append(f"  模块耗时汇总:")
+        lines.append(f"    破坏+修复 (DR)          : {st['time_dr']:.3f} s")
+        lines.append(f"    局部搜索/断点邻域 (LS)  : {st['time_ls']:.3f} s")
+        lines.append(f"    PSO 优化               : {st['time_pso']:.3f} s")
+
+        # 破坏算子表格
+        d_names = st['destroy_names']
+        d_calls = st['destroy_calls']
+        d_time  = st['destroy_time']
+        d_ic    = st['destroy_impr_cur']
+        d_ib    = st['destroy_impr_best']
+        lines.append(f"\n  破坏算子统计:")
+        lines.append(f"  {'算子名称':<14} {'调用次数':>8} {'总耗时(s)':>10} "
+                     f"{'改进当前解':>10} {'改进最优解':>10}")
+        lines.append(f"  {'-'*14} {'-'*8} {'-'*10} {'-'*10} {'-'*10}")
+        for i, name in enumerate(d_names):
+            lines.append(f"  {name:<14} {d_calls[i]:>8d} {d_time[i]:>10.3f} "
+                         f"{d_ic[i]:>10d} {d_ib[i]:>10d}")
+
+        # 修复算子表格
+        r_names = st['repair_names']
+        r_calls = st['repair_calls']
+        r_time  = st['repair_time']
+        r_ic    = st['repair_impr_cur']
+        r_ib    = st['repair_impr_best']
+        lines.append(f"\n  修复算子统计:")
+        lines.append(f"  {'算子名称':<14} {'调用次数':>8} {'总耗时(s)':>10} "
+                     f"{'改进当前解':>10} {'改进最优解':>10}")
+        lines.append(f"  {'-'*14} {'-'*8} {'-'*10} {'-'*10} {'-'*10}")
+        for i, name in enumerate(r_names):
+            lines.append(f"  {name:<14} {r_calls[i]:>8d} {r_time[i]:>10.3f} "
+                         f"{r_ic[i]:>10d} {r_ib[i]:>10d}")
+
+    lines.append("\n" + "=" * 80)
+    return "\n".join(lines) + "\n"
+
+
 def save_solution_txt(sol: Solution, inst: Instance, output_path: str,
-                      cost_history: List[float], solve_time: float = None):
+                      cost_history: List[float], solve_time: float = None,
+                      per_thread_stats: List[dict] = None):
     """保存解到txt文件"""
     total_cost = compute_cost(sol, inst)
     depot_x, depot_y = inst.node_coord(inst.depot_idx)
@@ -2163,6 +2606,11 @@ def save_solution_txt(sol: Solution, inst: Instance, output_path: str,
             f.write(f"初始解费用: {cost_history[0]:.6f} 元\n")
             if cost_history[0] > 0:
                 f.write(f"改进率: {(cost_history[0] - total_cost) / cost_history[0] * 100:.2f}%\n")
+
+        # ---- 算子统计表格（在断点配置之前）----
+        if per_thread_stats:
+            f.write("\n")
+            f.write(_format_stats_table(per_thread_stats))
 
         f.write("\n--- 断点配置 ---\n")
         for ei, bp in enumerate(sol.breakpoints):
@@ -2281,7 +2729,7 @@ def solve_instance(instance_path: str,
     t_start = time.time()
 
     if num_threads > 1:
-        best_sol, cost_history = parallel_solve(
+        best_sol, cost_history, per_thread_stats = parallel_solve(
             inst,
             num_threads=num_threads,
             max_iter=max_iter,
@@ -2303,6 +2751,22 @@ def solve_instance(instance_path: str,
             ls_freq=ls_freq,
         )
         best_sol, cost_history = solver.solve(verbose=verbose)
+        # 单线程：将统计包装成与并行模式相同的格式
+        per_thread_stats = [{
+            'destroy_names':      solver.destroy_names,
+            'repair_names':       solver.repair_names,
+            'destroy_calls':      solver.stats_destroy_calls,
+            'destroy_time':       solver.stats_destroy_time,
+            'destroy_impr_cur':   solver.stats_destroy_impr_cur,
+            'destroy_impr_best':  solver.stats_destroy_impr_best,
+            'repair_calls':       solver.stats_repair_calls,
+            'repair_time':        solver.stats_repair_time,
+            'repair_impr_cur':    solver.stats_repair_impr_cur,
+            'repair_impr_best':   solver.stats_repair_impr_best,
+            'time_dr':            solver.stats_time_dr,
+            'time_ls':            solver.stats_time_ls,
+            'time_pso':           solver.stats_time_pso,
+        }]
 
     solve_time = time.time() - t_start
     best_cost = compute_cost(best_sol, inst)
@@ -2311,7 +2775,8 @@ def solve_instance(instance_path: str,
         print_solution_detail(best_sol, inst, solve_time=solve_time)
 
     txt_path = os.path.join(output_dir, f"{basename}-GR.txt")
-    save_solution_txt(best_sol, inst, txt_path, cost_history, solve_time=solve_time)
+    save_solution_txt(best_sol, inst, txt_path, cost_history,
+                      solve_time=solve_time, per_thread_stats=per_thread_stats)
 
     conv_path = os.path.join(output_dir, f"{basename}-GR_convergence.png")
     plot_convergence(cost_history, conv_path)
