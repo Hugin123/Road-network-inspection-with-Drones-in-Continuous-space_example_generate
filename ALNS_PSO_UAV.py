@@ -552,21 +552,55 @@ def best_k_drones_solution(
     """
     自动选择最优无人机数量：对给定断点配置，枚举 k=1..active_drones，
     对每个 k 调用 greedy_build_solution_from_breakpoints(max_drones=k)，
-    返回总费用（含 call_cost）最低的方案。
+    优先返回满足电池约束的可行方案中费用最低者。
 
-    active_drones: 搜索上限（None 表示使用 inst.num_drones）。
-                   若已通过 greedy_estimate_min_drones 预估，传入预估值可避免重复枚举。
+    若在 active_drones 范围内找不到可行解，自动将搜索上限扩展到
+    inst.num_drones（硬上限），尝试用更多无人机获得可行解。
+    若达到硬上限仍无可行解（问题本身超出能力），则返回硬上限下费用最低方案。
+
+    active_drones: 优先搜索上限（None 表示直接使用 inst.num_drones）。
+                   若已通过 greedy_estimate_min_drones 预估，传入预估值可减少枚举量。
     """
-    limit = inst.num_drones if active_drones is None else max(1, min(active_drones, inst.num_drones))
-    best_sol = None
-    best_cost = float('inf')
-    for k in range(1, limit + 1):
+    soft_limit = inst.num_drones if active_drones is None else max(1, min(active_drones, inst.num_drones))
+    hard_limit = inst.num_drones   # 绝对上限
+
+    best_feasible_sol = None
+    best_feasible_cost = float('inf')
+    best_infeasible_sol = None
+    best_infeasible_cost = float('inf')
+
+    # 第一轮：在 soft_limit 内枚举，寻找可行解
+    for k in range(1, soft_limit + 1):
         sol_k = greedy_build_solution_from_breakpoints(inst, breakpoints, max_drones=k)
         cost_k = compute_cost(sol_k, inst)
-        if cost_k < best_cost:
-            best_cost = cost_k
-            best_sol = sol_k
-    return best_sol
+        if is_feasible(sol_k, inst):
+            if cost_k < best_feasible_cost:
+                best_feasible_cost = cost_k
+                best_feasible_sol = sol_k
+        else:
+            if cost_k < best_infeasible_cost:
+                best_infeasible_cost = cost_k
+                best_infeasible_sol = sol_k
+
+    # 若 soft_limit 范围内无可行解，且硬上限更大，则继续扩展搜索
+    if best_feasible_sol is None and soft_limit < hard_limit:
+        for k in range(soft_limit + 1, hard_limit + 1):
+            sol_k = greedy_build_solution_from_breakpoints(inst, breakpoints, max_drones=k)
+            cost_k = compute_cost(sol_k, inst)
+            if is_feasible(sol_k, inst):
+                if cost_k < best_feasible_cost:
+                    best_feasible_cost = cost_k
+                    best_feasible_sol = sol_k
+                # 继续枚举剩余 k，因为 k+1 架可能费用更低（多架可缩短路径）
+            else:
+                if cost_k < best_infeasible_cost:
+                    best_infeasible_cost = cost_k
+                    best_infeasible_sol = sol_k
+
+    # 优先返回可行解；达到硬上限仍不可行时返回费用最低的不可行解（兜底）
+    if best_feasible_sol is not None:
+        return best_feasible_sol
+    return best_infeasible_sol
 
 
 def greedy_estimate_min_drones(inst: Instance, verbose: bool = True) -> int:
@@ -607,14 +641,20 @@ def greedy_estimate_min_drones(inst: Instance, verbose: bool = True) -> int:
 
     for bps in test_configs:
         # 从最大值向下搜索最小可行 k
-        prev_feasible_k = inst.num_drones
+        # prev_feasible_k=None 表示尚未找到任何可行 k
+        prev_feasible_k = None
         for k in range(inst.num_drones, 0, -1):
             sol_k = greedy_build_solution_from_breakpoints(inst, bps, max_drones=k)
             if is_feasible(sol_k, inst):
                 prev_feasible_k = k
             else:
-                # k 不可行，回退到上一个可行的 k
+                # k 不可行，回退到上一个可行的 k（prev_feasible_k）
                 break
+
+        # 若此断点配置下找不到任何可行 k，跳过
+        if prev_feasible_k is None:
+            continue
+
         # 计算该断点配置下最小可行 k 的费用
         sol_best = greedy_build_solution_from_breakpoints(inst, bps, max_drones=prev_feasible_k)
         cost_best = compute_cost(sol_best, inst)
@@ -817,8 +857,12 @@ def multi_start_initial_solution(inst: Instance, n_starts: int = 8,
         cost_rand = compute_cost(sol_rand, inst)
         candidates.append((cost_rand, sol_rand))
 
-    # 选费用最低的
-    best_cost, best_sol = min(candidates, key=lambda x: x[0])
+    # 优先选可行解中费用最低的；若无可行候选则选费用最低的不可行解
+    feasible_candidates = [(c, s) for c, s in candidates if is_feasible(s, inst)]
+    if feasible_candidates:
+        best_cost, best_sol = min(feasible_candidates, key=lambda x: x[0])
+    else:
+        best_cost, best_sol = min(candidates, key=lambda x: x[0])
     return best_sol
 
 
@@ -1963,6 +2007,8 @@ class ALNSPSOSolver:
                  pso_iter: int = 20,
                  # 无人机数量预估结果（由 greedy_estimate_min_drones 提供）
                  active_drones: int = None,   # None 表示使用 inst.num_drones
+                 # 早停参数：连续多少次迭代全局最优无改进则提前终止（None=不启用）
+                 no_improve_limit: int = None,
                  ):
         self.inst = inst
         # 固定全程使用的无人机数量（由贪心预估确定，不再动态枚举）
@@ -1977,6 +2023,7 @@ class ALNSPSOSolver:
         self.decay = decay
         self.sa_cooling = sa_cooling
         self.pso_freq = pso_freq
+        self.no_improve_limit = no_improve_limit  # 早停：None 表示不启用
 
         self.pso = PSOBreakpointOptimizer(inst, pso_particles, pso_iter)
 
@@ -2240,6 +2287,7 @@ class ALNSPSOSolver:
         self.best_cost_history = [best_cost]
 
         start_time = time.time()
+        no_improve_count = 0  # 早停计数：连续迭代全局最优未改进次数
 
         for iteration in range(self.max_iter):
             removal_fraction = random.uniform(self.removal_min, self.removal_max)
@@ -2283,12 +2331,34 @@ class ALNSPSOSolver:
                 self.stats_time_ls += time.time() - _t_ls0
 
             new_cost = compute_cost(new_sol, inst)
+            new_feasible = is_feasible(new_sol, inst)
 
             # 判断接受/更新，并统计改进次数
+            # 可行性门控：不可行解不能更新 best_sol；
+            # 若当前 best/current 本身是不可行解，则不可行解之间仍可按费用比较改进。
             score = 0.0
             _impr_best = False
             _impr_cur  = False
-            if new_cost < best_cost:
+            current_feasible = is_feasible(current_sol, inst)
+            best_feasible    = is_feasible(best_sol,    inst)
+
+            # 判断 new_sol 是否优于 best_sol
+            def _better_than_best():
+                if new_feasible and not best_feasible:
+                    return True   # 新解可行，旧最优不可行 → 直接接受
+                if not new_feasible and best_feasible:
+                    return False  # 新解不可行，旧最优可行 → 拒绝
+                return new_cost < best_cost  # 同为可行/不可行 → 比费用
+
+            # 判断 new_sol 是否优于 current_sol
+            def _better_than_current():
+                if new_feasible and not current_feasible:
+                    return True
+                if not new_feasible and current_feasible:
+                    return False
+                return new_cost < current_cost
+
+            if _better_than_best():
                 best_sol = new_sol.copy()
                 best_cost = new_cost
                 current_sol = new_sol.copy()
@@ -2296,15 +2366,20 @@ class ALNSPSOSolver:
                 score = self.sigma1
                 _impr_best = True
                 _impr_cur  = True
-            elif new_cost < current_cost:
+                no_improve_count = 0  # 全局最优改进，重置早停计数
+            elif _better_than_current():
                 current_sol = new_sol.copy()
                 current_cost = new_cost
                 score = self.sigma2
                 _impr_cur = True
+                no_improve_count += 1
             elif self._sa_accept(current_cost, new_cost):
                 current_sol = new_sol.copy()
                 current_cost = new_cost
                 score = self.sigma3
+                no_improve_count += 1
+            else:
+                no_improve_count += 1
 
             if _impr_best:
                 self.stats_destroy_impr_best[di_op] += 1
@@ -2330,6 +2405,15 @@ class ALNSPSOSolver:
 
             self.cost_history.append(current_cost)
             self.best_cost_history.append(best_cost)
+
+            # 早停检测
+            if (self.no_improve_limit is not None
+                    and no_improve_count >= self.no_improve_limit):
+                if verbose:
+                    elapsed = time.time() - start_time
+                    print(f"  [早停] 连续 {no_improve_count} 次迭代全局最优未改进，"
+                          f"于第 {iteration+1} 次迭代提前终止（time: {elapsed:.1f}s）")
+                break
 
         # 最终对最优解做多轮断点精化
         if verbose:
@@ -2410,7 +2494,8 @@ class ALNSPSOSolver:
         self.cost_history = [current_cost]
         self.best_cost_history = [best_cost]
 
-        stagnation_count = 0   # 连续未改进计数
+        stagnation_count = 0   # 连续未改进计数（用于停滞重启）
+        no_improve_count = 0   # 早停计数：连续迭代全局最优未改进次数
 
         for iteration in range(self.max_iter):
             removal_fraction = random.uniform(self.removal_min, self.removal_max)
@@ -2451,33 +2536,55 @@ class ALNSPSOSolver:
                 self.stats_time_ls += time.time() - _t_ls0
 
             new_cost = compute_cost(new_sol, inst)
+            new_feasible = is_feasible(new_sol, inst)
 
-            # 接受准则，并统计改进次数
+            # 接受准则（可行性门控），并统计改进次数
             score = 0.0
             _impr_best = False
             _impr_cur  = False
-            if new_cost < best_cost:
+            current_feasible = is_feasible(current_sol, inst)
+            best_feasible    = is_feasible(best_sol,    inst)
+
+            def _pw_better_than_best():
+                if new_feasible and not best_feasible:
+                    return True
+                if not new_feasible and best_feasible:
+                    return False
+                return new_cost < best_cost
+
+            def _pw_better_than_current():
+                if new_feasible and not current_feasible:
+                    return True
+                if not new_feasible and current_feasible:
+                    return False
+                return new_cost < current_cost
+
+            if _pw_better_than_best():
                 best_sol = new_sol.copy()
                 best_cost = new_cost
                 current_sol = new_sol.copy()
                 current_cost = new_cost
                 score = self.sigma1
                 stagnation_count = 0          # 有改进，重置停滞计数
+                no_improve_count = 0          # 全局最优改进，重置早停计数
                 _impr_best = True
                 _impr_cur  = True
-            elif new_cost < current_cost:
+            elif _pw_better_than_current():
                 current_sol = new_sol.copy()
                 current_cost = new_cost
                 score = self.sigma2
                 stagnation_count += 1
+                no_improve_count += 1
                 _impr_cur = True
             elif self._sa_accept(current_cost, new_cost):
                 current_sol = new_sol.copy()
                 current_cost = new_cost
                 score = self.sigma3
                 stagnation_count += 1
+                no_improve_count += 1
             else:
                 stagnation_count += 1
+                no_improve_count += 1
 
             if _impr_best:
                 self.stats_destroy_impr_best[di_op] += 1
@@ -2519,10 +2626,19 @@ class ALNSPSOSolver:
                     if restarted_cost < best_cost:
                         best_sol = restarted.copy()
                         best_cost = restarted_cost
+                        no_improve_count = 0   # 拉取后若更新全局最优也重置早停计数
                     if verbose:
                         print(f"  [T{thread_id}] Iter {iteration+1:4d} pull_diverse "
                               f"pull={pull_cost:.4f} → restart={restarted_cost:.4f}")
                 stagnation_count = 0
+
+            # ---- 早停检测 ----
+            if (self.no_improve_limit is not None
+                    and no_improve_count >= self.no_improve_limit):
+                if verbose:
+                    print(f"  [T{thread_id}][早停] 连续 {no_improve_count} 次迭代全局最优未改进，"
+                          f"于第 {iteration+1} 次迭代提前终止")
+                break
 
         # ---- 最终精化（含断点协同搜索 + 位置精确求解）----
         # 第一轮：协同搜索
@@ -2597,11 +2713,12 @@ class SharedPool:
     """
     def __init__(self, capacity: int = 5, diversity_threshold: float = 0.8):
         self._lock = threading.Lock()
-        self._pool: List[Tuple[float, Solution]] = []   # (cost, sol)
+        self._pool: List[Tuple[float, Solution, int]] = []   # (cost, sol, thread_id)
         self.capacity = capacity
         self.diversity_threshold = diversity_threshold
         self.total_pushes = 0
         self.total_pulls = 0
+        self.best_thread_id = -1   # 当前全局最优所属线程
 
     def push(self, sol: Solution, cost: float, thread_id: int = -1):
         """
@@ -2617,7 +2734,7 @@ class SharedPool:
             # 找池中与新解结构最相似的解
             best_sim = 0.0
             best_sim_idx = -1
-            for idx, (c, s) in enumerate(self._pool):
+            for idx, (c, s, _tid) in enumerate(self._pool):
                 sim = _bp_jaccard_similarity(new_sig, _bp_signature(s))
                 if sim > best_sim:
                     best_sim = sim
@@ -2626,14 +2743,18 @@ class SharedPool:
             if best_sim >= self.diversity_threshold and best_sim_idx >= 0:
                 # 相似解：只在新解更好时替换
                 if cost < self._pool[best_sim_idx][0]:
-                    self._pool[best_sim_idx] = (cost, sol_copy)
+                    self._pool[best_sim_idx] = (cost, sol_copy, thread_id)
                     self._pool.sort(key=lambda x: x[0])
             else:
                 # 无相似解：直接加入
-                self._pool.append((cost, sol_copy))
+                self._pool.append((cost, sol_copy, thread_id))
                 self._pool.sort(key=lambda x: x[0])
                 if len(self._pool) > self.capacity:
                     self._pool = self._pool[:self.capacity]
+
+            # 更新全局最优所属线程
+            if self._pool:
+                self.best_thread_id = self._pool[0][2]
 
             self.total_pushes += 1
 
@@ -2642,7 +2763,7 @@ class SharedPool:
         with self._lock:
             self.total_pulls += 1
             if self._pool:
-                cost, sol = self._pool[0]
+                cost, sol, _tid = self._pool[0]
                 return sol.copy(), cost
             return None, float('inf')
 
@@ -2658,7 +2779,7 @@ class SharedPool:
             # 找与 current_sig 最不相似的解
             best_div = -1.0
             best_idx = 0
-            for idx, (c, s) in enumerate(self._pool):
+            for idx, (c, s, _tid) in enumerate(self._pool):
                 sim = _bp_jaccard_similarity(current_sig, _bp_signature(s))
                 div = 1.0 - sim
                 if div > best_div:
@@ -2667,14 +2788,14 @@ class SharedPool:
             # 若多样性改进不明显，回退到全局最优（idx=0）
             if best_div < 0.2:
                 best_idx = 0
-            cost, sol = self._pool[best_idx]
+            cost, sol, _tid = self._pool[best_idx]
             return sol.copy(), cost
 
     def global_best(self) -> Tuple[Optional[Solution], float]:
         """获取全局最优解（不计入 pull 统计）。"""
         with self._lock:
             if self._pool:
-                cost, sol = self._pool[0]
+                cost, sol, _tid = self._pool[0]
                 return sol.copy(), cost
             return None, float('inf')
 
@@ -2682,11 +2803,12 @@ class SharedPool:
         with self._lock:
             n = len(self._pool)
             best = self._pool[0][0] if self._pool else float('inf')
-            sigs = [_bp_signature(s) for _, s in self._pool]
+            sigs = [_bp_signature(s) for _, s, _tid in self._pool]
             n_unique = len(set(sigs))
         return (f"SharedPool: size={n}/{self.capacity}, "
                 f"best={best:.4f}, unique_structures={n_unique}, "
-                f"pushes={self.total_pushes}, pulls={self.total_pulls}")
+                f"pushes={self.total_pushes}, pulls={self.total_pulls}, "
+                f"best_thread={self.best_thread_id}")
 
 
 def parallel_solve(
@@ -2700,8 +2822,9 @@ def parallel_solve(
     pso_particles: int = 15,
     pso_iter: int = 20,
     active_drones: int = None,  # 预估得到的最少可行无人机数量
+    no_improve_limit: int = None,  # 早停：连续多少次迭代全局最优无改进则提前终止
     verbose: bool = True,
-) -> Tuple[Solution, List[float], List[dict]]:
+) -> Tuple[Solution, List[float], List[dict], dict]:
     """
     异步并行 ALNS+PSO 求解。
 
@@ -2744,6 +2867,7 @@ def parallel_solve(
             pso_particles=pso_particles,
             pso_iter=pso_iter,
             active_drones=active_drones,
+            no_improve_limit=no_improve_limit,
         )
         thread_solvers[tid] = solver
         sol, hist = solver.solve_parallel_worker(
@@ -2823,7 +2947,12 @@ def parallel_solve(
     if verbose:
         print(f"并行求解完成！全局最优费用: {best_cost:.4f}")
 
-    return best_sol, merged_hist, per_thread_stats
+    pool_stats = {
+        'total_pushes': pool.total_pushes,
+        'total_pulls':  pool.total_pulls,
+        'best_thread_id': pool.best_thread_id,
+    }
+    return best_sol, merged_hist, per_thread_stats, pool_stats
 
 
 # ============================================================
@@ -3305,7 +3434,8 @@ def solve_instance(instance_path: str,
                    num_threads: int = 1,
                    push_freq: int = 50,
                    stagnation_limit: int = 100,
-                   verbose: bool = True) -> Tuple[Solution, float]:
+                   no_improve_limit: int = None,
+                   verbose: bool = True) -> Tuple[Solution, float, List[dict], dict]:
     """
     对单个算例文件运行 ALNS+PSO 求解。
     默认输出目录：将路径中的 '算例' 替换为 '结果'，保持子目录结构不变。
@@ -3342,7 +3472,7 @@ def solve_instance(instance_path: str,
 
     if num_threads > 1:
         # 异步并行模式
-        best_sol, cost_history, per_thread_stats = parallel_solve(
+        best_sol, cost_history, per_thread_stats, pool_stats = parallel_solve(
             inst,
             num_threads=num_threads,
             max_iter=max_iter,
@@ -3352,6 +3482,7 @@ def solve_instance(instance_path: str,
             pso_particles=pso_particles,
             pso_iter=pso_iter,
             active_drones=active_drones,
+            no_improve_limit=no_improve_limit,
             verbose=verbose,
         )
     else:
@@ -3363,6 +3494,7 @@ def solve_instance(instance_path: str,
             pso_particles=pso_particles,
             pso_iter=pso_iter,
             active_drones=active_drones,
+            no_improve_limit=no_improve_limit,
         )
         best_sol, cost_history = solver.solve(verbose=verbose)
         # 单线程：将统计包装成与并行模式相同的格式
@@ -3381,6 +3513,7 @@ def solve_instance(instance_path: str,
             'time_ls':            solver.stats_time_ls,
             'time_pso':           solver.stats_time_pso,
         }]
+        pool_stats = {'total_pushes': 0, 'total_pulls': 0, 'best_thread_id': 0}
 
     solve_time = time.time() - t_start
     best_cost = compute_cost(best_sol, inst)
@@ -3402,7 +3535,7 @@ def solve_instance(instance_path: str,
     plot_solution(best_sol, inst, vis_path,
                   title=f"{basename} | Cost={best_cost:.2f}")
 
-    return best_sol, best_cost
+    return best_sol, best_cost, per_thread_stats, pool_stats
 
 
 if __name__ == "__main__":
@@ -3465,6 +3598,12 @@ if __name__ == "__main__":
         help="并行模式：连续多少次迭代无改进时从公共池拉取全局最优解（默认100）"
     )
     parser.add_argument(
+        "--no_improve_limit",
+        type=int,
+        default=None,
+        help="早停：连续多少次迭代全局最优无改进则提前终止（默认None=不启用）"
+    )
+    parser.add_argument(
         "--batch",
         action="store_true",
         help="批量求解某目录下所有算例"
@@ -3495,7 +3634,7 @@ if __name__ == "__main__":
                     out_dir = args.output_dir
                 else:
                     out_dir = _mirror_output_dir(fp, src_root="算例", dst_root="结果")
-                sol, cost = solve_instance(
+                sol, cost, _pts, _ps = solve_instance(
                     fp,
                     output_dir=out_dir,
                     max_iter=args.max_iter,
@@ -3505,6 +3644,7 @@ if __name__ == "__main__":
                     num_threads=args.num_threads,
                     push_freq=args.push_freq,
                     stagnation_limit=args.stagnation_limit,
+                    no_improve_limit=args.no_improve_limit,
                     verbose=False,
                 )
                 results.append((os.path.basename(fp), out_dir, cost, True))
@@ -3547,6 +3687,7 @@ if __name__ == "__main__":
             num_threads=args.num_threads,
             push_freq=args.push_freq,
             stagnation_limit=args.stagnation_limit,
+            no_improve_limit=args.no_improve_limit,
             verbose=True,
         )
 

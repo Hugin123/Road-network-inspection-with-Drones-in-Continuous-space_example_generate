@@ -1654,6 +1654,8 @@ class GiantRouteALNSSolver:
                  pso_particles: int = 20,
                  pso_iter: int = 30,
                  ls_freq: int = 25,
+                 # 早停参数：连续多少次迭代全局最优无改进则提前终止（None=不启用）
+                 no_improve_limit: int = None,
                  ):
         self.inst = inst
         self.max_iter = max_iter
@@ -1669,6 +1671,7 @@ class GiantRouteALNSSolver:
         self.ls_freq = ls_freq
         self.sa_temp_init = sa_temp_init
         self.sa_temp = sa_temp_init
+        self.no_improve_limit = no_improve_limit  # 早停：None 表示不启用
 
         self.pso = PSOBreakpointOptimizer(pso_particles, pso_iter)
 
@@ -1792,6 +1795,7 @@ class GiantRouteALNSSolver:
         self.cost_history = [current_cost]
         self.best_cost_history = [best_cost]
         start_time = time.time()
+        no_improve_count = 0  # 早停计数：连续迭代全局最优未改进次数
 
         for iteration in range(self.max_iter):
             removal_fraction = random.uniform(self.removal_min, self.removal_max)
@@ -1853,15 +1857,20 @@ class GiantRouteALNSSolver:
                 score = self.sigma1
                 _impr_best = True
                 _impr_cur  = True
+                no_improve_count = 0  # 全局最优改进，重置早停计数
             elif new_cost < current_cost - 1e-9:
                 current_gs = new_gs.copy()
                 current_cost = new_cost
                 score = self.sigma2
                 _impr_cur = True
+                no_improve_count += 1
             elif self._sa_accept(current_cost, new_cost):
                 current_gs = new_gs.copy()
                 current_cost = new_cost
                 score = self.sigma3
+                no_improve_count += 1
+            else:
+                no_improve_count += 1
 
             if _impr_best:
                 self.stats_destroy_impr_best[di_op] += 1
@@ -1883,6 +1892,15 @@ class GiantRouteALNSSolver:
 
             self.cost_history.append(current_cost)
             self.best_cost_history.append(best_cost)
+
+            # 早停检测
+            if (self.no_improve_limit is not None
+                    and no_improve_count >= self.no_improve_limit):
+                if verbose:
+                    elapsed = time.time() - start_time
+                    print(f"  [早停] 连续 {no_improve_count} 次迭代全局最优未改进，"
+                          f"于第 {iteration+1} 次迭代提前终止（time: {elapsed:.1f}s）")
+                break
 
         # ---- 最终精化 ----
         if verbose:
@@ -1979,7 +1997,8 @@ class GiantRouteALNSSolver:
 
         self.cost_history = [current_cost]
         self.best_cost_history = [best_cost]
-        stagnation_count = 0
+        stagnation_count = 0   # 连续未改进计数（用于停滞重启）
+        no_improve_count = 0   # 早停计数：连续迭代全局最优未改进次数
 
         for iteration in range(self.max_iter):
             removal_fraction = random.uniform(self.removal_min, self.removal_max)
@@ -2035,6 +2054,7 @@ class GiantRouteALNSSolver:
                 current_cost = new_cost
                 score = self.sigma1
                 stagnation_count = 0
+                no_improve_count = 0  # 全局最优改进，重置早停计数
                 _impr_best = True
                 _impr_cur  = True
             elif new_cost < current_cost - 1e-9:
@@ -2042,14 +2062,17 @@ class GiantRouteALNSSolver:
                 current_cost = new_cost
                 score = self.sigma2
                 stagnation_count += 1
+                no_improve_count += 1
                 _impr_cur = True
             elif self._sa_accept(current_cost, new_cost):
                 current_gs = new_gs.copy()
                 current_cost = new_cost
                 score = self.sigma3
                 stagnation_count += 1
+                no_improve_count += 1
             else:
                 stagnation_count += 1
+                no_improve_count += 1
 
             if _impr_best:
                 self.stats_destroy_impr_best[di_op] += 1
@@ -2088,12 +2111,21 @@ class GiantRouteALNSSolver:
                         if restarted_cost < best_cost - 1e-9:
                             best_gs = restarted_gs.copy()
                             best_cost = restarted_cost
+                            no_improve_count = 0  # 拉取后若更新全局最优也重置早停计数
                     except Exception:
                         pass
                     if verbose:
                         print(f"  [T{thread_id}] Iter {iteration+1:4d} "
                               f"pull_diverse → restart={current_cost:.4f}")
                 stagnation_count = 0
+
+            # ---- 早停检测 ----
+            if (self.no_improve_limit is not None
+                    and no_improve_count >= self.no_improve_limit):
+                if verbose:
+                    print(f"  [T{thread_id}][早停] 连续 {no_improve_count} 次迭代全局最优未改进，"
+                          f"于第 {iteration+1} 次迭代提前终止")
+                break
 
         # 最终精化
         final_gs = local_search_2opt(best_gs, inst, max_no_improve=2)
@@ -2167,12 +2199,13 @@ class SharedPool:
     """
     def __init__(self, capacity: int = 5, diversity_threshold: float = 0.8):
         self._lock = threading.Lock()
-        # 存储 (cost, Solution, GiantRouteSolution)
-        self._pool: List[Tuple[float, Solution, GiantRouteSolution]] = []
+        # 存储 (cost, Solution, GiantRouteSolution, thread_id)
+        self._pool: List[Tuple[float, Solution, GiantRouteSolution, int]] = []
         self.capacity = capacity
         self.diversity_threshold = diversity_threshold
         self.total_pushes = 0
         self.total_pulls = 0
+        self.best_thread_id = -1   # 当前全局最优所属线程
 
     def push(self, sol: Solution, cost: float, thread_id: int,
              gs: GiantRouteSolution = None):
@@ -2183,7 +2216,7 @@ class SharedPool:
 
             best_sim = 0.0
             best_sim_idx = -1
-            for idx, (c, s, g) in enumerate(self._pool):
+            for idx, (c, s, g, _tid) in enumerate(self._pool):
                 sig = _gs_signature(g) if g is not None else frozenset()
                 sim = _jaccard(new_sig, sig)
                 if sim > best_sim:
@@ -2192,20 +2225,24 @@ class SharedPool:
 
             if best_sim >= self.diversity_threshold and best_sim_idx >= 0:
                 if cost < self._pool[best_sim_idx][0]:
-                    self._pool[best_sim_idx] = (cost, sol_copy, gs_copy)
+                    self._pool[best_sim_idx] = (cost, sol_copy, gs_copy, thread_id)
                     self._pool.sort(key=lambda x: x[0])
             else:
-                self._pool.append((cost, sol_copy, gs_copy))
+                self._pool.append((cost, sol_copy, gs_copy, thread_id))
                 self._pool.sort(key=lambda x: x[0])
                 if len(self._pool) > self.capacity:
                     self._pool = self._pool[:self.capacity]
+
+            # 更新全局最优所属线程
+            if self._pool:
+                self.best_thread_id = self._pool[0][3]
 
             self.total_pushes += 1
 
     def global_best(self) -> Tuple[Optional[Solution], float]:
         with self._lock:
             if self._pool:
-                cost, sol, _ = self._pool[0]
+                cost, sol, _gs, _tid = self._pool[0]
                 return sol.copy(), cost
             return None, float('inf')
 
@@ -2220,7 +2257,7 @@ class SharedPool:
             current_sig = _gs_signature(current_gs)
             best_div = -1.0
             best_idx = 0
-            for idx, (c, s, g) in enumerate(self._pool):
+            for idx, (c, s, g, _tid) in enumerate(self._pool):
                 sig = _gs_signature(g) if g is not None else frozenset()
                 div = 1.0 - _jaccard(current_sig, sig)
                 if div > best_div:
@@ -2228,7 +2265,7 @@ class SharedPool:
                     best_idx = idx
             if best_div < 0.2:
                 best_idx = 0
-            cost, sol, gs = self._pool[best_idx]
+            cost, sol, gs, _tid = self._pool[best_idx]
             return (gs.copy() if gs is not None else None), cost
 
     def stats(self) -> str:
@@ -2237,7 +2274,8 @@ class SharedPool:
             best = self._pool[0][0] if self._pool else float('inf')
         return (f"SharedPool: size={n}/{self.capacity}, "
                 f"best={best:.4f}, "
-                f"pushes={self.total_pushes}, pulls={self.total_pulls}")
+                f"pushes={self.total_pushes}, pulls={self.total_pulls}, "
+                f"best_thread={self.best_thread_id}")
 
 
 def parallel_solve(
@@ -2251,9 +2289,10 @@ def parallel_solve(
     pso_particles: int = 20,
     pso_iter: int = 30,
     ls_freq: int = 25,
+    no_improve_limit: int = None,  # 早停：连续多少次迭代全局最优无改进则提前终止
     verbose: bool = True,
-) -> Tuple[Solution, List[float], List[dict]]:
-    """异步并行 Giant Route ALNS+PSO 求解，返回 (best_sol, merged_hist, per_thread_stats)"""
+) -> Tuple[Solution, List[float], List[dict], dict]:
+    """异步并行 Giant Route ALNS+PSO 求解，返回 (best_sol, merged_hist, per_thread_stats, pool_stats)"""
     pool = SharedPool(capacity=pool_capacity)
 
     if verbose:
@@ -2274,6 +2313,7 @@ def parallel_solve(
             pso_particles=pso_particles,
             pso_iter=pso_iter,
             ls_freq=ls_freq,
+            no_improve_limit=no_improve_limit,
         )
         thread_solvers[tid] = solver
         sol, hist = solver.solve_parallel_worker(
@@ -2344,7 +2384,12 @@ def parallel_solve(
     if verbose:
         print(f"并行求解完成！全局最优费用: {best_cost:.4f}")
 
-    return best_sol, merged_hist, per_thread_stats
+    pool_stats = {
+        'total_pushes': pool.total_pushes,
+        'total_pulls':  pool.total_pulls,
+        'best_thread_id': pool.best_thread_id,
+    }
+    return best_sol, merged_hist, per_thread_stats, pool_stats
 
 
 # ============================================================
@@ -2707,7 +2752,8 @@ def solve_instance(instance_path: str,
                    num_threads: int = 1,
                    push_freq: int = 50,
                    stagnation_limit: int = 100,
-                   verbose: bool = True) -> Tuple[Solution, float]:
+                   no_improve_limit: int = None,
+                   verbose: bool = True) -> Tuple[Solution, float, List[dict], dict]:
     """对单个算例文件运行 Giant Route ALNS+PSO 求解"""
     inst = parse_instance(instance_path)
     basename = os.path.splitext(os.path.basename(instance_path))[0]
@@ -2729,7 +2775,7 @@ def solve_instance(instance_path: str,
     t_start = time.time()
 
     if num_threads > 1:
-        best_sol, cost_history, per_thread_stats = parallel_solve(
+        best_sol, cost_history, per_thread_stats, pool_stats = parallel_solve(
             inst,
             num_threads=num_threads,
             max_iter=max_iter,
@@ -2739,6 +2785,7 @@ def solve_instance(instance_path: str,
             pso_particles=pso_particles,
             pso_iter=pso_iter,
             ls_freq=ls_freq,
+            no_improve_limit=no_improve_limit,
             verbose=verbose,
         )
     else:
@@ -2749,6 +2796,7 @@ def solve_instance(instance_path: str,
             pso_particles=pso_particles,
             pso_iter=pso_iter,
             ls_freq=ls_freq,
+            no_improve_limit=no_improve_limit,
         )
         best_sol, cost_history = solver.solve(verbose=verbose)
         # 单线程：将统计包装成与并行模式相同的格式
@@ -2767,6 +2815,7 @@ def solve_instance(instance_path: str,
             'time_ls':            solver.stats_time_ls,
             'time_pso':           solver.stats_time_pso,
         }]
+        pool_stats = {'total_pushes': 0, 'total_pulls': 0, 'best_thread_id': 0}
 
     solve_time = time.time() - t_start
     best_cost = compute_cost(best_sol, inst)
@@ -2785,7 +2834,7 @@ def solve_instance(instance_path: str,
     plot_solution(best_sol, inst, vis_path,
                   title=f"{basename} | Cost={best_cost:.2f} (GiantRoute)")
 
-    return best_sol, best_cost
+    return best_sol, best_cost, per_thread_stats, pool_stats
 
 
 if __name__ == "__main__":
@@ -2813,6 +2862,8 @@ if __name__ == "__main__":
                         help="并行模式：推送频率（默认50）")
     parser.add_argument("--stagnation_limit", type=int, default=100,
                         help="并行模式：停滞阈值（默认100）")
+    parser.add_argument("--no_improve_limit", type=int, default=None,
+                        help="早停：连续多少次迭代全局最优无改进则提前终止（默认None=不启用）")
     parser.add_argument("--batch", action="store_true", help="批量求解")
     parser.add_argument("--batch_dir", default=None, help="批量求解目录")
 
@@ -2830,7 +2881,7 @@ if __name__ == "__main__":
             try:
                 out_dir = (args.output_dir if args.output_dir
                            else _mirror_output_dir(fp, "算例", "结果"))
-                sol, cost = solve_instance(
+                sol, cost, _pts, _ps = solve_instance(
                     fp, output_dir=out_dir,
                     max_iter=args.max_iter,
                     pso_freq=args.pso_freq,
@@ -2840,6 +2891,7 @@ if __name__ == "__main__":
                     num_threads=args.num_threads,
                     push_freq=args.push_freq,
                     stagnation_limit=args.stagnation_limit,
+                    no_improve_limit=args.no_improve_limit,
                     verbose=False,
                 )
                 results.append((os.path.basename(fp), out_dir, cost, True))
@@ -2879,6 +2931,7 @@ if __name__ == "__main__":
             num_threads=args.num_threads,
             push_freq=args.push_freq,
             stagnation_limit=args.stagnation_limit,
+            no_improve_limit=args.no_improve_limit,
             verbose=True,
         )
 

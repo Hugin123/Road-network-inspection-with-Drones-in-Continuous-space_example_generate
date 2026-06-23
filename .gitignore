@@ -1,3 +1,6 @@
 __pycache__/
+cache/
 .DS_Store
 算例/.DS_Store
+Cplus/build/
+Cplus/__pycache__/
