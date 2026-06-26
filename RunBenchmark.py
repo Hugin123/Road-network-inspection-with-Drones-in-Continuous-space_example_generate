@@ -17,7 +17,6 @@ RunBenchmark.py
 from __future__ import annotations
 
 import csv
-import json
 import os
 import re
 import shutil
@@ -813,9 +812,22 @@ def main():
             print(f"[SKIP] 目录不存在: {inst_dir}")
             continue
 
-        all_files = sorted(f for f in os.listdir(inst_dir) if f.endswith('.txt'))
+        all_files_raw = sorted(f for f in os.listdir(inst_dir) if f.endswith('.txt'))
+
+        # 大规模只运行节点数 >= 46 的算例（46-70 及以上规模）
+        if scale_dir == "2-Large":
+            all_files = [
+                f for f in all_files_raw
+                if (parsed_tmp := parse_instance_name(f)) is not None
+                and parsed_tmp[0] >= 46
+            ]
+        else:
+            all_files = all_files_raw
+
         print(f"\n{'='*60}")
-        print(f"规模: {scale_name} | 算例数: {len(all_files)}")
+        print(f"规模: {scale_name} | 算例数: {len(all_files)}"
+              + (f"（共 {len(all_files_raw)} 个，已筛选 nodes≥46）"
+                 if scale_dir == "2-Large" else ""))
         print(f"{'='*60}")
 
         for fname in all_files:

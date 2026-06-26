@@ -523,8 +523,10 @@ def save_instance(filepath, G, scaled_pos, depot_pos, num_drones):
 SAVE_TXT = True
 SAVE_PNG = True
 
-# 无人机数量
-NUM_DRONES = 10
+# 无人机数量（路网节点数 < 45 时使用 10 架，>= 45 时使用 20 架）
+NUM_DRONES_DEFAULT = 10
+NUM_DRONES_LARGE   = 20
+NUM_DRONES_THRESHOLD = 45   # road_nodes >= 此值时改用 NUM_DRONES_LARGE
 
 # 每种模式每组配置生成的算例数
 NUM_INSTANCES_PER_MODE = 2
@@ -596,6 +598,11 @@ if __name__ == "__main__":
                 actual_edges = G.number_of_edges()
                 total_nodes  = road_nodes + 1
 
+                # 根据路网节点数确定无人机数量
+                num_drones = (NUM_DRONES_LARGE
+                              if road_nodes >= NUM_DRONES_THRESHOLD
+                              else NUM_DRONES_DEFAULT)
+
                 # 收集5个基站位置
                 all_depot_positions = []
                 for depot_id, direction in DEPOT_DIRECTIONS:
@@ -603,14 +610,14 @@ if __name__ == "__main__":
                     all_depot_positions.append((depot_id, direction, depot_pos))
 
                     if SAVE_TXT:
-                        filename = (f"{total_nodes}-{actual_edges}-{NUM_DRONES}"
+                        filename = (f"{total_nodes}-{actual_edges}-{num_drones}"
                                     f"-{depot_id}-({mode}-{inst_idx}).txt")
                         filepath = os.path.join(OUTPUT_DIR, filename)
-                        save_instance(filepath, G, scaled_pos, depot_pos, NUM_DRONES)
+                        save_instance(filepath, G, scaled_pos, depot_pos, num_drones)
                         total_saved += 1
 
                 if SAVE_PNG:
-                    fig_name = (f"{total_nodes}-{actual_edges}-{NUM_DRONES}"
+                    fig_name = (f"{total_nodes}-{actual_edges}-{num_drones}"
                                 f"-({mode}-{inst_idx}).png")
                     fig_path = os.path.join(OUTPUT_DIR, fig_name)
                     save_network_figure(fig_path, G, scaled_pos,
