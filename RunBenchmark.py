@@ -58,8 +58,8 @@ CSV_PATHS = {
 
 SCALES = [
     # ("0-Small",  "小规模"),
-    # ("1-Medium", "中等规模"),
-    ("2-Large",  "大规模"),
+    ("1-Medium", "中等规模"),
+    # ("2-Large",  "大规模"),
 ]
 
 # ALNS / GR 的算子名（静态已知）

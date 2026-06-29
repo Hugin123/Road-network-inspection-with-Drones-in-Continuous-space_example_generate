@@ -32,12 +32,15 @@ COLOR_GR = '#FF5722'   # GR（GiantRoute）
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_SMALL  = os.path.join(BASE_DIR, '结果', '随机算例求解结果_小规模.csv')
 CSV_MEDIUM = os.path.join(BASE_DIR, '结果', '随机算例求解结果_中等规模.csv')
+CSV_LARGE  = os.path.join(BASE_DIR, '结果', '随机算例求解结果_大规模.csv')
 
 OUT_SMALL  = os.path.join(BASE_DIR, '结果图表分析', '随机算例', '小规模算例分析')
 OUT_MEDIUM = os.path.join(BASE_DIR, '结果图表分析', '随机算例', '中等规模算例分析')
+OUT_LARGE  = os.path.join(BASE_DIR, '结果图表分析', '随机算例', '大规模算例分析')
 
 os.makedirs(OUT_SMALL,  exist_ok=True)
 os.makedirs(OUT_MEDIUM, exist_ok=True)
+os.makedirs(OUT_LARGE,  exist_ok=True)
 
 
 # ============================================================
@@ -727,6 +730,440 @@ def plot_distance_heatmap(df, out_dir, scale_name):
 
 
 # ============================================================
+# 图7a：目标函数与求解时间对比分析（双纵轴柱状+折线图）
+# ============================================================
+
+def _calc_obj_time(df, scales):
+    """公共数据计算，供 7a/7b 复用"""
+    mr_obj  = [df[df['规模标识'] == s]['ALNS_PSO_目标函数_均值'].mean()      for s in scales]
+    gr_obj  = [df[df['规模标识'] == s]['GiantRoute_目标函数_均值'].mean()    for s in scales]
+    mr_time = [df[df['规模标识'] == s]['ALNS_PSO_求解时间_均值(s)'].mean()   for s in scales]
+    gr_time = [df[df['规模标识'] == s]['GiantRoute_求解时间_均值(s)'].mean() for s in scales]
+    return mr_obj, gr_obj, mr_time, gr_time
+
+
+def plot_obj_time_compare(df, out_dir, scale_name):
+    """07a：MR vs GR 目标函数（柱）+ 求解时间（折线）对比分析"""
+    scales = sort_scales(df['规模标识'].unique())
+    x = np.arange(len(scales))
+    bar_w = 0.35
+    mr_obj, gr_obj, mr_time, gr_time = _calc_obj_time(df, scales)
+
+    fig, ax = plt.subplots(figsize=(max(14, len(scales) * 0.9), 7))
+    axr = ax.twinx()
+
+    # 柱状图：目标函数
+    b1 = ax.bar(x - bar_w/2, mr_obj, bar_w, color=COLOR_MR, alpha=0.78, label='MR 目标函数')
+    b2 = ax.bar(x + bar_w/2, gr_obj, bar_w, color=COLOR_GR, alpha=0.78, label='GR 目标函数')
+
+    # 折线图：求解时间
+    l1, = axr.plot(x, mr_time, 'o--', color=COLOR_MR, linewidth=2.2,
+                   markersize=7, label='MR 求解时间')
+    l2, = axr.plot(x, gr_time, 's--', color=COLOR_GR, linewidth=2.2,
+                   markersize=7, label='GR 求解时间')
+
+    ax.set_ylabel('目标函数均值（m）', fontsize=12)
+    axr.set_ylabel('求解时间均值（s）', fontsize=12)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f'{v:,.0f}'))
+    ax.set_xticks(x)
+    ax.set_xticklabels(scales, rotation=45, ha='right', fontsize=9)
+    ax.set_xlabel('算例规模（节点数-边数）', fontsize=12)
+    ax.set_title(f'【{scale_name}】MR 与 GR 目标函数（柱）及求解时间（折线）对比',
+                 fontsize=14, fontweight='bold')
+    ax.grid(axis='y', alpha=0.3)
+
+    handles = [b1, b2, l1, l2]
+    labels  = ['MR 目标函数', 'GR 目标函数', 'MR 求解时间', 'GR 求解时间']
+    ax.legend(handles, labels, fontsize=11, loc='upper left', ncol=2)
+
+    plt.tight_layout()
+    path = os.path.join(out_dir, '07a_目标函数与求解时间_对比分析.png')
+    plt.savefig(path); plt.close()
+    print(f'  ✓ {os.path.basename(path)}')
+
+
+# ============================================================
+# 图7b：目标函数与求解时间差值分析（双纵轴柱状+折线图）
+# ============================================================
+
+def plot_obj_time_diff(df, out_dir, scale_name):
+    """07b：GR − MR 目标函数差（柱）+ 求解时间差（折线）差值分析"""
+    scales = sort_scales(df['规模标识'].unique())
+    x = np.arange(len(scales))
+    bar_w = 0.5
+    mr_obj, gr_obj, mr_time, gr_time = _calc_obj_time(df, scales)
+
+    obj_diff  = [g - m for g, m in zip(gr_obj,  mr_obj)]
+    time_diff = [g - m for g, m in zip(gr_time, mr_time)]
+
+    fig, ax = plt.subplots(figsize=(max(14, len(scales) * 0.9), 7))
+    axr = ax.twinx()
+
+    # 柱状图：目标函数差（正=MR更优，负=GR更优）
+    bar_colors = [COLOR_MR if v >= 0 else COLOR_GR for v in obj_diff]
+    bars = ax.bar(x, obj_diff, bar_w, color=bar_colors, alpha=0.75,
+                  label='目标函数差 GR−MR（蓝正=MR优，橙负=GR优）')
+
+    # 折线图：求解时间差
+    l1, = axr.plot(x, time_diff, 'D-', color='#9C27B0', linewidth=2.3,
+                   markersize=7, label='求解时间差 GR−MR（s）')
+
+    # 参考零线
+    ax.axhline(0, color='black', linewidth=1, linestyle='--', alpha=0.45)
+    axr.axhline(0, color='#9C27B0', linewidth=1, linestyle=':', alpha=0.5)
+
+    ax.set_ylabel('目标函数差（GR−MR，m）\n正值 → MR 更优', fontsize=12)
+    axr.set_ylabel('求解时间差（GR−MR，s）\n正值 → MR 更快', fontsize=12, color='#9C27B0')
+    axr.yaxis.label.set_color('#9C27B0')
+    axr.tick_params(axis='y', colors='#9C27B0')
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f'{v:+,.0f}'))
+    ax.set_xticks(x)
+    ax.set_xticklabels(scales, rotation=45, ha='right', fontsize=9)
+    ax.set_xlabel('算例规模（节点数-边数）', fontsize=12)
+    ax.set_title(f'【{scale_name}】MR 与 GR 目标函数（柱）及求解时间（折线）差值分析\n（GR − MR，正值均表示 MR 更优）',
+                 fontsize=13, fontweight='bold')
+    ax.grid(axis='y', alpha=0.3)
+
+    handles = [bars, l1]
+    labels  = ['目标函数差 GR−MR（蓝=MR优，橙=GR优）', '求解时间差 GR−MR（s）']
+    ax.legend(handles, labels, fontsize=11, loc='upper left')
+
+    plt.tight_layout()
+    path = os.path.join(out_dir, '07b_目标函数与求解时间_差值分析.png')
+    plt.savefig(path); plt.close()
+    print(f'  ✓ {os.path.basename(path)}')
+
+
+# ============================================================
+# 大规模专用：数据读取（算例类型维度）
+# ============================================================
+
+def load_data_large(csv_path):
+    """大规模算例数据加载，额外提取算例类型（grid/linear/radial/random）"""
+    df = pd.read_csv(csv_path, encoding='utf-8-sig')
+    df['节点数']   = df['节点数'].astype(int)
+    df['边数']     = df['边数'].astype(int)
+    df['无人机数'] = df['无人机数'].astype(int)
+    df['基站编号'] = df['基站编号'].astype(int)
+    df['规模标识'] = df['节点数'].astype(str) + 'V-' + df['边数'].astype(str) + 'E'
+    # 大规模算例名格式：26-30-10-1-(grid-0)，提取类型名
+    df['算例类型'] = df['算例名'].str.extract(r'\(([a-z]+)-\d+\)$')
+    df['算例基名'] = (df['节点数'].astype(str) + '-' + df['边数'].astype(str)
+                   + '-' + df['无人机数'].astype(str) + '-' + df['基站编号'].astype(str))
+    df['目标函数_Gap(%)'] = (
+        (df['GiantRoute_目标函数_均值'] - df['ALNS_PSO_目标函数_均值'])
+        / df['GiantRoute_目标函数_均值'] * 100
+    )
+    df['时间节省率(%)'] = (
+        (df['GiantRoute_求解时间_均值(s)'] - df['ALNS_PSO_求解时间_均值(s)'])
+        / df['GiantRoute_求解时间_均值(s)'] * 100
+    )
+    return df
+
+
+# ============================================================
+# 大规模图L01：按算例类型对比求解时间（箱线图+均值折线）
+# ============================================================
+
+def plot_large_time_by_type(df, out_dir, scale_name):
+    """L01：4 种算例类型 × MR/GR 求解时间箱线图对比"""
+    types = sorted(df['算例类型'].dropna().unique())
+    data_mr = [df[df['算例类型'] == t]['ALNS_PSO_求解时间_均值(s)'].values for t in types]
+    data_gr = [df[df['算例类型'] == t]['GiantRoute_求解时间_均值(s)'].values for t in types]
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+    fig.suptitle(f'【{scale_name}】不同算例类型的求解时间对比（MR vs GR）',
+                 fontsize=14, fontweight='bold')
+
+    # 子图1：箱线图
+    ax = axes[0]
+    make_boxplot_pair(ax, data_mr, data_gr, types)
+    ax.set_xlabel('算例类型', fontsize=12)
+    ax.set_ylabel('求解时间（s）', fontsize=12)
+    ax.set_title('各算例类型求解时间分布', fontsize=12)
+
+    # 子图2：按规模×类型均值折线图
+    ax = axes[1]
+    scales = sort_scales(df['规模标识'].unique())
+    x = np.arange(len(scales))
+    type_colors = {'grid': '#1E88E5', 'linear': '#43A047', 'radial': '#FB8C00', 'random': '#E53935'}
+    for t in types:
+        sub = df[df['算例类型'] == t]
+        mr_vals = [sub[sub['规模标识'] == s]['ALNS_PSO_求解时间_均值(s)'].mean() for s in scales]
+        gr_vals = [sub[sub['规模标识'] == s]['GiantRoute_求解时间_均值(s)'].mean() for s in scales]
+        c = type_colors.get(t, 'gray')
+        ax.plot(x, mr_vals, 'o-', color=c, linewidth=2, label=f'{t} MR')
+        ax.plot(x, gr_vals, 's--', color=c, linewidth=2, alpha=0.6, label=f'{t} GR')
+    ax.set_xticks(x)
+    ax.set_xticklabels(scales, rotation=45, ha='right', fontsize=8)
+    ax.set_xlabel('算例规模（节点数-边数）', fontsize=11)
+    ax.set_ylabel('求解时间均值（s）', fontsize=11)
+    ax.set_title('按规模随算例类型变化趋势\n（实线=MR，虚线=GR）', fontsize=11)
+    ax.legend(fontsize=8, ncol=2, loc='upper left')
+    ax.grid(axis='y', alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(out_dir, 'L01_按算例类型_求解时间对比.png')
+    plt.savefig(path); plt.close()
+    print(f'  ✓ {os.path.basename(path)}')
+
+
+# ============================================================
+# 大规模图L02：按算例类型对比目标函数 Gap 改进率（柱状图 + 热力图）
+# ============================================================
+
+def plot_large_gap_by_type(df, out_dir, scale_name):
+    """L02：4 种算例类型下 MR vs GR 目标函数改进率"""
+    types = sorted(df['算例类型'].dropna().unique())
+    scales = sort_scales(df['规模标识'].unique())
+
+    fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+    fig.suptitle(f'【{scale_name}】不同算例类型的目标函数改进率 Gap（MR 相对 GR，正值=MR更优）',
+                 fontsize=13, fontweight='bold')
+
+    # 子图1：各算例类型 Gap 箱线图
+    ax = axes[0]
+    data_gap = [df[df['算例类型'] == t]['目标函数_Gap(%)'].values for t in types]
+    type_colors_list = ['#1E88E5', '#43A047', '#FB8C00', '#E53935']
+    bp = ax.boxplot(data_gap, positions=np.arange(len(types)), widths=0.6,
+                    patch_artist=True,
+                    medianprops=dict(color='white', linewidth=2.5),
+                    whiskerprops=dict(color='#555'),
+                    capprops=dict(color='#555'),
+                    flierprops=dict(marker='o', alpha=0.5, markersize=4))
+    for patch, c in zip(bp['boxes'], type_colors_list[:len(types)]):
+        patch.set_facecolor(c); patch.set_alpha(0.75)
+    ax.axhline(y=0, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+    means = [np.nanmean(d) for d in data_gap]
+    for i, m in enumerate(means):
+        ax.text(i, m, f'{m:.1f}%', ha='center', va='bottom', fontsize=9,
+                color='#1B5E20', fontweight='bold')
+    ax.set_xticks(np.arange(len(types)))
+    ax.set_xticklabels(types, fontsize=11)
+    ax.set_xlabel('算例类型', fontsize=11)
+    ax.set_ylabel('目标函数改进率 Gap（%）', fontsize=11)
+    ax.set_title('各算例类型整体 Gap 分布', fontsize=12)
+    ax.grid(axis='y', alpha=0.3)
+
+    # 子图2：算例类型 × 规模 Gap 热力图
+    ax = axes[1]
+    pivot_data = df.groupby(['算例类型', '规模标识'])['目标函数_Gap(%)'].mean().reset_index()
+    pivot = pivot_data.pivot(index='算例类型', columns='规模标识', values='目标函数_Gap(%)')
+    # 列按规模排序
+    ordered_cols = [c for c in scales if c in pivot.columns]
+    pivot = pivot[ordered_cols]
+
+    vals = pivot.values.astype(float)
+    finite = vals[np.isfinite(vals)]
+    vmax = max(abs(finite).max(), 5) if len(finite) > 0 else 5
+
+    im = ax.imshow(vals, cmap='RdYlGn', aspect='auto', vmin=-vmax, vmax=vmax)
+    ax.set_xticks(np.arange(len(pivot.columns)))
+    ax.set_xticklabels(pivot.columns, rotation=45, ha='right', fontsize=8)
+    ax.set_yticks(np.arange(len(pivot.index)))
+    ax.set_yticklabels(pivot.index, fontsize=10)
+    ax.set_xlabel('算例规模', fontsize=11)
+    ax.set_ylabel('算例类型', fontsize=11)
+    ax.set_title('算例类型 × 规模 Gap 热力图\n（绿=MR更优，红=GR更优）', fontsize=11)
+    for i in range(vals.shape[0]):
+        for j in range(vals.shape[1]):
+            v = vals[i, j]
+            if np.isfinite(v):
+                tc = 'white' if abs(v) > vmax * 0.55 else 'black'
+                ax.text(j, i, f'{v:.1f}%', ha='center', va='center',
+                        fontsize=7.5, color=tc, fontweight='bold')
+    plt.colorbar(im, ax=ax, label='Gap（%）')
+
+    plt.tight_layout()
+    path = os.path.join(out_dir, 'L02_按算例类型_目标函数Gap分析.png')
+    plt.savefig(path); plt.close()
+    print(f'  ✓ {os.path.basename(path)}')
+
+
+# ============================================================
+# 大规模图L03：按算例类型分析算子改进效率差异
+# ============================================================
+
+def plot_large_operator_by_type(df, out_dir, scale_name):
+    """L03：各算例类型下两算法算子改进效率热力图"""
+    types = sorted(df['算例类型'].dropna().unique())
+
+    def op_rate(sub, imp_col, call_col):
+        imp   = sub[imp_col].mean()
+        calls = sub[call_col].mean()
+        return (imp / calls * 100) if (calls and calls > 0) else 0
+
+    # MR 算子列表
+    mr_ops = [
+        ('random破坏', 'ALNS_PSO_破坏_random_改进最优解_均值',   'ALNS_PSO_破坏_random_调用次数_均值'),
+        ('worst破坏',  'ALNS_PSO_破坏_worst_改进最优解_均值',    'ALNS_PSO_破坏_worst_调用次数_均值'),
+        ('route破坏',  'ALNS_PSO_破坏_route_改进最优解_均值',    'ALNS_PSO_破坏_route_调用次数_均值'),
+        ('bp_split破坏','ALNS_PSO_破坏_bp_split_改进最优解_均值','ALNS_PSO_破坏_bp_split_调用次数_均值'),
+        ('greedy修复', 'ALNS_PSO_修复_greedy_改进最优解_均值',   'ALNS_PSO_修复_greedy_调用次数_均值'),
+        ('random修复', 'ALNS_PSO_修复_random_改进最优解_均值',   'ALNS_PSO_修复_random_调用次数_均值'),
+        ('bp_aware修复','ALNS_PSO_修复_bp_aware_改进最优解_均值','ALNS_PSO_修复_bp_aware_调用次数_均值'),
+    ]
+    # GR 算子列表
+    gr_ops = [
+        ('random破坏', 'GiantRoute_破坏_random_改进最优解_均值',  'GiantRoute_破坏_random_调用次数_均值'),
+        ('worst破坏',  'GiantRoute_破坏_worst_改进最优解_均值',   'GiantRoute_破坏_worst_调用次数_均值'),
+        ('segment破坏','GiantRoute_破坏_segment_改进最优解_均值', 'GiantRoute_破坏_segment_调用次数_均值'),
+        ('greedy修复', 'GiantRoute_修复_greedy_改进最优解_均值',  'GiantRoute_修复_greedy_调用次数_均值'),
+        ('random修复', 'GiantRoute_修复_random_改进最优解_均值',  'GiantRoute_修复_random_调用次数_均值'),
+        ('regret修复', 'GiantRoute_修复_regret_改进最优解_均值',  'GiantRoute_修复_regret_调用次数_均值'),
+    ]
+
+    def build_matrix(ops, df_sub):
+        rows = []
+        for t in types:
+            sub = df_sub[df_sub['算例类型'] == t]
+            row = [op_rate(sub, ic, cc) for _, ic, cc in ops]
+            rows.append(row)
+        return np.array(rows, dtype=float)
+
+    mr_mat = build_matrix(mr_ops, df)
+    gr_mat = build_matrix(gr_ops, df)
+
+    fig, axes = plt.subplots(1, 2, figsize=(20, max(5, len(types) + 1)))
+    fig.suptitle(f'【{scale_name}】按算例类型的算子改进效率热力图\n（改进最优解次数/调用次数×100%）',
+                 fontsize=13, fontweight='bold')
+
+    def draw_op_heatmap(ax, mat, ops, title, cmap='YlOrRd'):
+        op_names = [name for name, _, _ in ops]
+        vmax = np.nanmax(mat) if np.nanmax(mat) > 0 else 1
+        im = ax.imshow(mat, cmap=cmap, aspect='auto', vmin=0, vmax=vmax)
+        ax.set_xticks(np.arange(len(op_names)))
+        ax.set_xticklabels(op_names, rotation=35, ha='right', fontsize=9)
+        ax.set_yticks(np.arange(len(types)))
+        ax.set_yticklabels(types, fontsize=10)
+        ax.set_xlabel('算子名称', fontsize=11)
+        ax.set_ylabel('算例类型', fontsize=11)
+        ax.set_title(title, fontsize=12, fontweight='bold')
+        for i in range(mat.shape[0]):
+            for j in range(mat.shape[1]):
+                v = mat[i, j]
+                tc = 'white' if v > vmax * 0.6 else 'black'
+                ax.text(j, i, f'{v:.1f}%', ha='center', va='center',
+                        fontsize=9, color=tc, fontweight='bold')
+        plt.colorbar(im, ax=ax, label='改进效率（%）')
+
+    draw_op_heatmap(axes[0], mr_mat, mr_ops, 'MR 算子改进效率（按算例类型）', cmap='Blues')
+    draw_op_heatmap(axes[1], gr_mat, gr_ops, 'GR 算子改进效率（按算例类型）', cmap='Oranges')
+
+    plt.tight_layout()
+    path = os.path.join(out_dir, 'L03_按算例类型_算子改进效率热力图.png')
+    plt.savefig(path); plt.close()
+    print(f'  ✓ {os.path.basename(path)}')
+
+
+# ============================================================
+# 大规模图L04：按算例类型对比求解时间节省率与目标函数并排柱状图
+# ============================================================
+
+def plot_large_type_compare_bar(df, out_dir, scale_name):
+    """L04：按算例类型并排柱状：MR/GR 目标函数均值 + 时间节省率"""
+    types = sorted(df['算例类型'].dropna().unique())
+    x = np.arange(len(types))
+    bar_w = 0.35
+
+    mr_obj  = [df[df['算例类型'] == t]['ALNS_PSO_目标函数_均值'].mean()    for t in types]
+    gr_obj  = [df[df['算例类型'] == t]['GiantRoute_目标函数_均值'].mean()  for t in types]
+    mr_time = [df[df['算例类型'] == t]['ALNS_PSO_求解时间_均值(s)'].mean() for t in types]
+    gr_time = [df[df['算例类型'] == t]['GiantRoute_求解时间_均值(s)'].mean() for t in types]
+    gap     = [df[df['算例类型'] == t]['目标函数_Gap(%)'].mean()           for t in types]
+    saving  = [df[df['算例类型'] == t]['时间节省率(%)'].mean()              for t in types]
+
+    fig, axes = plt.subplots(2, 2, figsize=(18, 12))
+    fig.suptitle(f'【{scale_name}】按算例类型综合对比分析', fontsize=14, fontweight='bold')
+
+    # 子图1：目标函数均值对比
+    ax = axes[0, 0]
+    ax.bar(x - bar_w/2, mr_obj, bar_w, color=COLOR_MR, alpha=0.8, label='MR 目标函数')
+    ax.bar(x + bar_w/2, gr_obj, bar_w, color=COLOR_GR, alpha=0.8, label='GR 目标函数')
+    ax.set_xticks(x); ax.set_xticklabels(types, fontsize=11)
+    ax.set_ylabel('目标函数均值（m）', fontsize=11)
+    ax.set_title('目标函数均值对比', fontsize=12)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f'{v:,.0f}'))
+    ax.legend(fontsize=10); ax.grid(axis='y', alpha=0.3)
+
+    # 子图2：求解时间均值对比
+    ax = axes[0, 1]
+    ax.bar(x - bar_w/2, mr_time, bar_w, color=COLOR_MR, alpha=0.8, label='MR 求解时间')
+    ax.bar(x + bar_w/2, gr_time, bar_w, color=COLOR_GR, alpha=0.8, label='GR 求解时间')
+    ax.set_xticks(x); ax.set_xticklabels(types, fontsize=11)
+    ax.set_ylabel('求解时间均值（s）', fontsize=11)
+    ax.set_title('求解时间均值对比', fontsize=12)
+    ax.legend(fontsize=10); ax.grid(axis='y', alpha=0.3)
+
+    # 子图3：目标函数改进率 Gap
+    ax = axes[1, 0]
+    bar_colors = [COLOR_MR if v >= 0 else COLOR_GR for v in gap]
+    ax.bar(x, gap, 0.5, color=bar_colors, alpha=0.8)
+    ax.axhline(0, color='black', linewidth=1.2, linestyle='--', alpha=0.5)
+    for i, v in enumerate(gap):
+        ax.text(i, v + (0.3 if v >= 0 else -0.8), f'{v:.1f}%',
+                ha='center', fontsize=10, color='#1B5E20' if v >= 0 else '#B71C1C', fontweight='bold')
+    ax.set_xticks(x); ax.set_xticklabels(types, fontsize=11)
+    ax.set_ylabel('目标函数改进率（%）', fontsize=11)
+    ax.set_title('MR 相对 GR 目标函数改进率\n（正值=MR更优）', fontsize=12)
+    ax.grid(axis='y', alpha=0.3)
+
+    # 子图4：时间节省率
+    ax = axes[1, 1]
+    save_colors = ['#43A047' if v >= 0 else '#E53935' for v in saving]
+    ax.bar(x, saving, 0.5, color=save_colors, alpha=0.8)
+    ax.axhline(0, color='black', linewidth=1.2, linestyle='--', alpha=0.5)
+    for i, v in enumerate(saving):
+        ax.text(i, v + (0.5 if v >= 0 else -1.5), f'{v:.1f}%',
+                ha='center', fontsize=10, color='#1B5E20' if v >= 0 else '#B71C1C', fontweight='bold')
+    ax.set_xticks(x); ax.set_xticklabels(types, fontsize=11)
+    ax.set_ylabel('时间节省率（%）', fontsize=11)
+    ax.set_title('MR 相对 GR 求解时间节省率\n（正值=MR更快）', fontsize=12)
+    ax.grid(axis='y', alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(out_dir, 'L04_按算例类型_综合对比.png')
+    plt.savefig(path); plt.close()
+    print(f'  ✓ {os.path.basename(path)}')
+
+
+# ============================================================
+# 大规模图L05：不同算例类型下规模增长对求解时间影响（分面折线图）
+# ============================================================
+
+def plot_large_scale_trend_by_type(df, out_dir, scale_name):
+    """L05：每种算例类型单独一行，展示随规模增大 MR/GR 求解时间走势"""
+    types = sorted(df['算例类型'].dropna().unique())
+    scales = sort_scales(df['规模标识'].unique())
+    x = np.arange(len(scales))
+
+    fig, axes = plt.subplots(len(types), 1, figsize=(16, 4 * len(types)), sharex=False)
+    if len(types) == 1:
+        axes = [axes]
+    fig.suptitle(f'【{scale_name}】各算例类型随规模增大的求解时间走势（MR vs GR）',
+                 fontsize=14, fontweight='bold')
+
+    for ax, t in zip(axes, types):
+        sub = df[df['算例类型'] == t]
+        mr_vals = [sub[sub['规模标识'] == s]['ALNS_PSO_求解时间_均值(s)'].mean()   for s in scales]
+        gr_vals = [sub[sub['规模标识'] == s]['GiantRoute_求解时间_均值(s)'].mean() for s in scales]
+        ax.plot(x, mr_vals, 'o-', color=COLOR_MR, linewidth=2.2, markersize=7, label='MR')
+        ax.plot(x, gr_vals, 's--', color=COLOR_GR, linewidth=2.2, markersize=7, label='GR')
+        ax.fill_between(x, mr_vals, gr_vals, alpha=0.12,
+                        color=COLOR_MR if np.mean(mr_vals) < np.mean(gr_vals) else COLOR_GR)
+        ax.set_xticks(x)
+        ax.set_xticklabels(scales, rotation=40, ha='right', fontsize=8)
+        ax.set_ylabel('求解时间均值（s）', fontsize=10)
+        ax.set_title(f'算例类型：{t}', fontsize=12, fontweight='bold')
+        ax.legend(fontsize=10); ax.grid(axis='y', alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(out_dir, 'L05_各算例类型规模扩展求解时间趋势.png')
+    plt.savefig(path); plt.close()
+    print(f'  ✓ {os.path.basename(path)}')
+
+
+# ============================================================
 # 主流程
 # ============================================================
 
@@ -743,10 +1180,45 @@ def run_all(csv_path, out_dir, scale_name):
 
     plot_objective_boxplot(df, out_dir, scale_name)    # 01
     plot_time_boxplot(df, out_dir, scale_name)         # 02
-    plot_operator_calls(df, out_dir, scale_name)       # 06（原）
-    plot_operator_improvement(df, out_dir, scale_name) # 07（原）
-    plot_module_time(df, out_dir, scale_name)          # 08（原）
-    plot_distance_heatmap(df, out_dir, scale_name)     # 新增：飞行距离热力图
+    plot_operator_calls(df, out_dir, scale_name)       # 03
+    plot_operator_improvement(df, out_dir, scale_name) # 04
+    plot_module_time(df, out_dir, scale_name)          # 05
+    plot_distance_heatmap(df, out_dir, scale_name)     # 06
+    plot_obj_time_compare(df, out_dir, scale_name)    # 07a 对比分析
+    plot_obj_time_diff(df, out_dir, scale_name)       # 07b 差值分析
+
+    print(f'  全部图表已保存到: {out_dir}')
+
+
+def run_large(csv_path, out_dir, scale_name):
+    """大规模算例专用主流程：复用通用图表 + 大规模特有图表（按算例类型维度）"""
+    print(f'\n{"="*60}')
+    print(f'处理 {scale_name}: {os.path.basename(csv_path)}')
+    print(f'输出目录: {out_dir}')
+    print('='*60)
+
+    df = load_data_large(csv_path)
+    print(f'  数据加载完成，共 {len(df)} 条记录，'
+          f'{df["规模标识"].nunique()} 个规模，'
+          f'{df["基站编号"].nunique()} 个基站，'
+          f'{df["算例类型"].nunique()} 种算例类型（{", ".join(sorted(df["算例类型"].dropna().unique()))}）')
+
+    # ── 复用通用图表（01~07b）──────────────────────────────────
+    plot_objective_boxplot(df, out_dir, scale_name)    # 01
+    plot_time_boxplot(df, out_dir, scale_name)         # 02
+    plot_operator_calls(df, out_dir, scale_name)       # 03
+    plot_operator_improvement(df, out_dir, scale_name) # 04
+    plot_module_time(df, out_dir, scale_name)          # 05
+    plot_distance_heatmap(df, out_dir, scale_name)     # 06
+    plot_obj_time_compare(df, out_dir, scale_name)     # 07a 对比分析
+    plot_obj_time_diff(df, out_dir, scale_name)        # 07b 差值分析
+
+    # ── 大规模特有图表（按算例类型维度）──────────────────────────
+    plot_large_time_by_type(df, out_dir, scale_name)        # L01
+    plot_large_gap_by_type(df, out_dir, scale_name)         # L02
+    plot_large_operator_by_type(df, out_dir, scale_name)    # L03
+    plot_large_type_compare_bar(df, out_dir, scale_name)    # L04
+    plot_large_scale_trend_by_type(df, out_dir, scale_name) # L05
 
     print(f'  全部图表已保存到: {out_dir}')
 
@@ -754,5 +1226,6 @@ def run_all(csv_path, out_dir, scale_name):
 if __name__ == '__main__':
     run_all(CSV_SMALL,  OUT_SMALL,  '小规模算例')
     run_all(CSV_MEDIUM, OUT_MEDIUM, '中等规模算例')
+    run_large(CSV_LARGE, OUT_LARGE, '大规模算例')
     print('\n✅ 全部完成！')
 

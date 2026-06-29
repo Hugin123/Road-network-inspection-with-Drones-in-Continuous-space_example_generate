@@ -12,7 +12,7 @@
 Solution split_dp(
     const std::vector<SubEdge>& giant_route,
     const Instance& inst,
-    int max_drones)
+    int max_drones)  // max_drones <= 0 表示不限制
 {
     int n = (int)giant_route.size();
     if (n == 0) {
@@ -93,8 +93,8 @@ Solution split_dp(
 
     if (dp[n] == INF) {
         std::ostringstream oss;
-        oss << "Split DP 无法在 " << max_drones
-            << " 架无人机内完成所有子边的覆盖";
+        oss << "Split DP 无法完成所有子边的覆盖（每条子边单独飞行能量均可行，" 
+            << "但组合后无解，请检查算例参数）";
         throw std::runtime_error(oss.str());
     }
 
@@ -108,15 +108,10 @@ Solution split_dp(
     }
     std::reverse(segments.begin(), segments.end());
 
-    if ((int)segments.size() > max_drones) {
-        std::ostringstream oss;
-        oss << "Split DP 最优切割需要 " << segments.size()
-            << " 架无人机，超过上限 " << max_drones;
-        throw std::runtime_error(oss.str());
-    }
-
-    // 构建 Solution
-    Solution sol(inst.num_drones, inst.num_edges);
+    // 不限制无人机数量：实际使用段数可能超过 inst.num_drones
+    // Solution 内部路径槽数取二者较大值，确保容纳所有段
+    int actual_drones = std::max(inst.num_drones, (int)segments.size());
+    Solution sol(actual_drones, inst.num_edges);
     for (int drone_idx = 0; drone_idx < (int)segments.size(); ++drone_idx) {
         auto [si, ei_] = segments[drone_idx];
         std::vector<SubEdge> seg_ses(
@@ -130,7 +125,8 @@ Solution split_dp(
 }
 
 Solution gs_to_solution(const GiantRouteSolution& gs, const Instance& inst) {
-    Solution sol = split_dp(gs.giant_route, inst, inst.num_drones);
+    // max_drones=0 表示不限制无人机数量，由 DP 自行决定最少切割数
+    Solution sol = split_dp(gs.giant_route, inst, 0);
     sol.breakpoints = gs.breakpoints;
     return sol;
 }

@@ -68,11 +68,12 @@ json build_output_json(
     json out;
 
     // ---- 基本信息 ----
-    out["total_cost"] = best_cost;
-    out["solve_time"] = solve_time;
-    out["num_drones"] = inst.num_drones;
-    out["num_edges"]  = inst.num_edges;
-    out["num_nodes"]  = inst.total_nodes;
+    out["total_cost"]      = best_cost;
+    out["solve_time"]      = solve_time;
+    out["num_drones"]      = inst.num_drones;          // 算例声明的无人机数
+    out["num_drones_used"] = (int)sol.routes.size();   // 实际使用的无人机数（不限制时可超过声明值）
+    out["num_edges"]       = inst.num_edges;
+    out["num_nodes"]       = inst.total_nodes;
 
     // ---- 算例参数 ----
     json params;
@@ -123,8 +124,9 @@ json build_output_json(
     out["edges"] = edges_list;
 
     // ---- 各无人机路径（完整飞行数据，供绘图）----
+    // 遍历实际路径数（不限制时可能超过 inst.num_drones）
     json routes_list;
-    for (int di = 0; di < inst.num_drones; ++di) {
+    for (int di = 0; di < (int)sol.routes.size(); ++di) {
         const auto& route = sol.routes[di];
         json route_json;
         route_json["drone_idx"] = di;
