@@ -49,17 +49,31 @@ ROOT        = os.path.dirname(os.path.abspath(__file__))
 INST_ROOT   = os.path.join(ROOT, "算例", "随机算例")
 RESULT_ROOT = os.path.join(ROOT, "结果", "随机算例")
 
-# 三个规模对应的 CSV 输出路径
+# 实际算例路径
+REAL_INST_ROOT   = os.path.join(ROOT, "算例", "实际算例")
+REAL_RESULT_ROOT = os.path.join(ROOT, "结果", "实际算例")
+
+# 三个规模对应的 CSV 输出路径（随机算例）
 CSV_PATHS = {
     "0-Small":  os.path.join(ROOT, "结果", "随机算例求解结果_小规模.csv"),
     "1-Medium": os.path.join(ROOT, "结果", "随机算例求解结果_中等规模.csv"),
     "2-Large":  os.path.join(ROOT, "结果", "随机算例求解结果_大规模.csv"),
 }
 
+# 实际算例 CSV 输出路径
+REAL_CSV_PATHS = {
+    "2-Large": os.path.join(ROOT, "结果", "实际算例求解结果_大规模.csv"),
+}
+
 SCALES = [
     # ("0-Small",  "小规模"),
-    ("1-Medium", "中等规模"),
-    # ("2-Large",  "大规模"),
+    # ("1-Medium", "中等规模"),
+    ("2-Large",  "大规模"),
+]
+
+# 实际算例运行规模配置
+REAL_SCALES = [
+    ("2-Large", "实际大规模"),
 ]
 
 # ALNS / GR 的算子名（静态已知）
@@ -767,13 +781,15 @@ def build_row(
 # --------------------------------------------------------------------------
 # CSV 初始化：若文件不存在（或为空）则写入表头，否则追加模式续写
 # --------------------------------------------------------------------------
-def init_csv(scale_dir: str, header: List[str]):
+def init_csv(scale_dir: str, header: List[str], csv_path_dict: dict = None):
     """
     初始化对应规模的 CSV 文件。
     - 文件不存在或内容为空时，创建并写入表头行。
     - 文件已存在且非空时，跳过（支持断点续跑追加）。
+    csv_path_dict: 指定路径字典，None 则使用随机算例的 CSV_PATHS。
     """
-    csv_path = CSV_PATHS[scale_dir]
+    path_dict = csv_path_dict if csv_path_dict is not None else CSV_PATHS
+    csv_path = path_dict[scale_dir]
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
         with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
@@ -786,48 +802,57 @@ def init_csv(scale_dir: str, header: List[str]):
 # --------------------------------------------------------------------------
 # 追加单行数据到 CSV（即时落盘）
 # --------------------------------------------------------------------------
-def append_csv_row(scale_dir: str, row: List):
+def append_csv_row(scale_dir: str, row: List, csv_path_dict: dict = None):
     """将一行结果立即追加写入对应规模的 CSV 文件。"""
-    csv_path = CSV_PATHS[scale_dir]
+    path_dict = csv_path_dict if csv_path_dict is not None else CSV_PATHS
+    csv_path = path_dict[scale_dir]
     with open(csv_path, "a", newline="", encoding="utf-8-sig") as f:
         csv.writer(f).writerow(row)
     print(f"  [CSV] 已写入: {os.path.basename(csv_path)}", flush=True)
 
 
 # --------------------------------------------------------------------------
-# 主流程
+# 通用批量求解流程（随机算例 / 实际算例均复用）
 # --------------------------------------------------------------------------
-def main():
-    header = build_header()
+def run_scales(
+    scales: List,
+    inst_root: str,
+    result_root: str,
+    csv_path_dict: dict,
+    header: List[str],
+    filter_fn=None,
+):
+    """
+    对 scales 中每个 (scale_dir, scale_name) 批量求解算例并写入 CSV。
 
-    # 初始化三个 CSV 文件（不存在则创建并写表头，已存在则追加续写）
-    for scale_dir, _ in SCALES:
-        init_csv(scale_dir, header)
+    参数
+    ------
+    scales        : [(scale_dir, scale_name), ...]
+    inst_root     : 算例根目录
+    result_root   : 结果根目录
+    csv_path_dict : CSV 路径字典（{scale_dir: csv_path}）
+    header        : CSV 表头
+    filter_fn     : 可选过滤函数 filter_fn(scale_dir, files) -> files
+    """
+    # 初始化 CSV
+    for scale_dir, _ in scales:
+        init_csv(scale_dir, header, csv_path_dict)
 
-    for scale_dir, scale_name in SCALES:
-        inst_dir    = os.path.join(INST_ROOT, scale_dir)
-        result_base = os.path.join(RESULT_ROOT, scale_dir)
+    for scale_dir, scale_name in scales:
+        inst_dir    = os.path.join(inst_root, scale_dir)
+        result_base = os.path.join(result_root, scale_dir)
 
         if not os.path.isdir(inst_dir):
             print(f"[SKIP] 目录不存在: {inst_dir}")
             continue
 
         all_files_raw = sorted(f for f in os.listdir(inst_dir) if f.endswith('.txt'))
-
-        # 大规模只运行节点数 >= 46 的算例（46-70 及以上规模）
-        if scale_dir == "2-Large":
-            all_files = [
-                f for f in all_files_raw
-                if (parsed_tmp := parse_instance_name(f)) is not None
-                and parsed_tmp[0] >= 46
-            ]
-        else:
-            all_files = all_files_raw
+        all_files = filter_fn(scale_dir, all_files_raw) if filter_fn else all_files_raw
 
         print(f"\n{'='*60}")
         print(f"规模: {scale_name} | 算例数: {len(all_files)}"
-              + (f"（共 {len(all_files_raw)} 个，已筛选 nodes≥46）"
-                 if scale_dir == "2-Large" else ""))
+              + (f"（共 {len(all_files_raw)} 个，已过滤）"
+                 if len(all_files) != len(all_files_raw) else ""))
         print(f"{'='*60}")
 
         for fname in all_files:
@@ -861,11 +886,50 @@ def main():
                 traceback.print_exc()
                 gr_result = None
 
-            # ---- 立即追加写入 CSV（出一行结果写一行，不等全部完成）----
+            # ---- 立即追加写入 CSV ----
             row = build_row(inst_name, nodes, edges, drones, station,
                             alns_result, gr_result)
-            append_csv_row(scale_dir, row)
-        # break
+            append_csv_row(scale_dir, row, csv_path_dict)
+
+
+# --------------------------------------------------------------------------
+# 主流程
+# --------------------------------------------------------------------------
+def main():
+    header = build_header()
+
+    # ================================================================
+    # 一、随机算例
+    # ================================================================
+    def _random_filter(scale_dir, files):
+        """大规模随机算例只跑 nodes >= 46 的算例。"""
+        if scale_dir == "2-Large":
+            return [
+                f for f in files
+                if (p := parse_instance_name(f)) is not None and p[0] >= 46
+            ]
+        return files
+
+    # run_scales(
+    #     scales       = SCALES,
+    #     inst_root    = INST_ROOT,
+    #     result_root  = RESULT_ROOT,
+    #     csv_path_dict= CSV_PATHS,
+    #     header       = header,
+    #     filter_fn    = _random_filter,
+    # )
+
+    # ================================================================
+    # 二、实际算例
+    # ================================================================
+    run_scales(
+        scales       = REAL_SCALES,
+        inst_root    = REAL_INST_ROOT,
+        result_root  = REAL_RESULT_ROOT,
+        csv_path_dict= REAL_CSV_PATHS,
+        header       = header,
+        filter_fn    = None,   # 实际算例全部运行，不过滤
+    )
 
 
 if __name__ == "__main__":
